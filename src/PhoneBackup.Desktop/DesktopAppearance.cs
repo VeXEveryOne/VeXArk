@@ -12,7 +12,8 @@ public sealed record DesktopPreferences(
     string RepositoryPath,
     string MediaDestination,
     string Theme,
-    string Language);
+    string Language,
+    IReadOnlyDictionary<string, string> MediaTransports);
 
 public static class DesktopSettingsStore
 {
@@ -33,7 +34,8 @@ public static class DesktopSettingsStore
                 Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
                 "VeXArk Media"),
             "system",
-            "en");
+            "en",
+            new Dictionary<string, string>(StringComparer.Ordinal));
         lock (Gate)
         {
             if (!File.Exists(SettingsPath)) return defaults;
@@ -46,7 +48,8 @@ public static class DesktopSettingsStore
                     RepositoryPath = Read(root, "repositoryPath") ?? defaults.RepositoryPath,
                     MediaDestination = Read(root, "mediaDestination") ?? defaults.MediaDestination,
                     Theme = NormalizeTheme(Read(root, "theme")),
-                    Language = NormalizeLanguage(Read(root, "language"))
+                    Language = NormalizeLanguage(Read(root, "language")),
+                    MediaTransports = ReadMediaTransports(root)
                 };
             }
             catch (Exception error) when (error is IOException or JsonException)
@@ -69,7 +72,13 @@ public static class DesktopSettingsStore
                     repositoryPath = settings.RepositoryPath,
                     mediaDestination = settings.MediaDestination,
                     theme = NormalizeTheme(settings.Theme),
-                    language = NormalizeLanguage(settings.Language)
+                    language = NormalizeLanguage(settings.Language),
+                    mediaTransports = settings.MediaTransports
+                        .OrderBy(x => x.Key, StringComparer.Ordinal)
+                        .ToDictionary(
+                            x => x.Key,
+                            x => NormalizeMediaTransport(x.Value),
+                            StringComparer.Ordinal)
                 }));
             File.Move(temporary, SettingsPath, overwrite: true);
         }
@@ -87,6 +96,24 @@ public static class DesktopSettingsStore
 
     public static string NormalizeLanguage(string? value) =>
         value?.ToLowerInvariant() == "ru" ? "ru" : "en";
+
+    public static string NormalizeMediaTransport(string? value) =>
+        value?.ToLowerInvariant() is "adb" or "fastlan" ? value.ToLowerInvariant() : "auto";
+
+    private static IReadOnlyDictionary<string, string> ReadMediaTransports(JsonElement root)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!root.TryGetProperty("mediaTransports", out var transports) ||
+            transports.ValueKind != JsonValueKind.Object)
+            return result;
+        foreach (var property in transports.EnumerateObject())
+        {
+            if (!string.IsNullOrWhiteSpace(property.Name) &&
+                property.Value.ValueKind == JsonValueKind.String)
+                result[property.Name] = NormalizeMediaTransport(property.Value.GetString());
+        }
+        return result;
+    }
 }
 
 public sealed record ChoiceOption(string Key, string Label)
@@ -265,7 +292,12 @@ public static class LocalizationManager
             "Copy every original from the phone to a regular Windows folder. Root is not required.",
         ["Куда сохранить"] = "Destination",
         ["Выбрать папку"] = "Choose folder",
+        ["Транспорт данных"] = "Data transport",
         ["Скопировать все фото и видео"] = "Copy all photos and videos",
+        ["Перед копированием Auto проверит ADB, Fast Wi-Fi и диск назначения."] =
+            "Auto will test ADB, Fast Wi-Fi and the destination drive before copying.",
+        ["Копируются оригиналы из MediaStore. На телефоне ничего не удаляется."] =
+            "Originals are copied from MediaStore. Nothing is deleted from the phone.",
         ["Безопасно и просто"] = "Safe and simple",
         ["✓ Сохраняются DCIM, Pictures, Movies и папки мессенджеров"] =
             "✓ Includes DCIM, Pictures, Movies and messenger folders",
@@ -337,8 +369,23 @@ public static class LocalizationManager
         ("Открытие manifests", "Opening manifests"),
         ("Репозиторий открыт", "Repository opened"),
         ("Телефон составляет список фото и видео", "The phone is listing photos and videos"),
+        ("Проверка скорости диска", "Testing destination drive speed"),
+        ("Проверка скорости ADB", "Testing ADB speed"),
+        ("Проверка Fast Wi-Fi", "Testing Fast Wi-Fi"),
+        ("Fast Wi-Fi недоступен", "Fast Wi-Fi is unavailable"),
+        ("Используется ADB", "Using ADB"),
+        ("Fast Wi-Fi прерван, продолжение через ADB", "Fast Wi-Fi interrupted, resuming over ADB"),
         ("Копирование завершено", "Copy complete"),
         ("Фото и видео скопированы", "Photos and videos copied"),
+        ("Скопировано:", "Copied:"),
+        ("Уже было на ПК:", "Already on PC:"),
+        ("Продолжено:", "Resumed:"),
+        ("Ошибок:", "Errors:"),
+        ("Всего найдено:", "Total found:"),
+        ("Транспорт:", "Transport:"),
+        ("Средняя скорость:", "Average speed:"),
+        ("Тесты:", "Benchmarks:"),
+        ("Первые ошибки:", "First errors:"),
         ("Создание локального файла резервной копии", "Creating portable backup file"),
         ("Локальная резервная копия сохранена одним файлом", "Portable backup saved"),
         ("Импорт локальной резервной копии", "Importing portable backup"),

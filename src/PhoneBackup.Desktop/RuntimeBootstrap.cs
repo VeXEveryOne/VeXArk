@@ -4,7 +4,7 @@ namespace PhoneBackup.Desktop;
 
 public static class RuntimeBootstrap
 {
-    private const string RuntimeVersion = "0.6.1";
+    private const string RuntimeVersion = "0.7.0";
     private static readonly string Root = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "PhoneBackup",

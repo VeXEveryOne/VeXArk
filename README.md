@@ -5,12 +5,12 @@
   <p>
     <a href="docs/README.ru.md">Русский</a> ·
     <a href="https://vexeveryone.github.io/VeXArk/">Website</a> ·
-    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.1">Downloads</a> ·
+    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.7.0">Downloads</a> ·
     <a href="CHANGELOG.md">Changelog</a> ·
     <a href="SECURITY.md">Security</a>
   </p>
   <p>
-    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.1">
+    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.7.0">
       <img alt="GitHub release" src="https://img.shields.io/github/v/release/VeXEveryOne/VeXArk?include_prereleases&style=flat-square">
     </a>
     <a href="https://github.com/VeXEveryOne/VeXArk/actions/workflows/build.yml">
@@ -39,9 +39,9 @@ when Magisk, KernelSU or APatch is available.
 
 | Platform | Package | Requirements |
 | --- | --- | --- |
-| Windows | [Download `VeXArk.exe`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/VeXArk.exe) | Windows 10/11 x64 |
-| Android | [Download `VeXArk-Agent.apk`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/VeXArk-Agent.apk) | Android 10–16, arm64-v8a |
-| Checksums | [`SHA256SUMS.txt`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/SHA256SUMS.txt) | Verify before installing |
+| Windows | [Download `VeXArk.exe`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/VeXArk.exe) | Windows 10/11 x64 |
+| Android | [Download `VeXArk-Agent.apk`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/VeXArk-Agent.apk) | Android 10–16, arm64-v8a |
+| Checksums | [`SHA256SUMS.txt`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/SHA256SUMS.txt) | Verify before installing |
 
 The Windows build is self-contained and portable. It bundles the matching Agent
 APK and Android Platform Tools; neither an installer nor administrator rights are
@@ -52,6 +52,8 @@ required.
 - **Offline by design.** No account, cloud backend, analytics or telemetry.
 - **No-root photo migration.** Copy every MediaStore photo and video into an
   ordinary Windows folder while preserving directories and skipping duplicates.
+- **Fast Wi-Fi and resume.** VeXArk benchmarks ADB, encrypted direct LAN and the
+  destination disk, copies with up to four workers and resumes interrupted files.
 - **Encrypted portable backups.** Export a selected snapshot as one `.vexark`
   file and import it on another PC.
 - **Incremental storage.** FastCDC chunking, BLAKE3 addressing and deduplication
@@ -147,7 +149,8 @@ capability-gated and still require broader device/ROM validation before a stable
 1.0 release.
 
 See the complete [changelog](CHANGELOG.md), [threat model](docs/THREAT_MODEL.md)
-and [contribution guide](CONTRIBUTING.md).
+[Fast Media protocol](docs/FAST_MEDIA_PROTOCOL.md) and
+[contribution guide](CONTRIBUTING.md).
 
 ## License and acknowledgements
 

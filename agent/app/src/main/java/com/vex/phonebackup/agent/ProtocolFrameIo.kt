@@ -34,16 +34,19 @@ object ProtocolFrameIo {
         return AgentFrame(type, ByteArray(length).also(data::readFully))
     }
 
-    @Synchronized
-    fun write(output: OutputStream, type: FrameType, payload: ByteArray) {
+    fun write(
+        output: OutputStream,
+        type: FrameType,
+        payload: ByteArray,
+        length: Int = payload.size
+    ) {
+        require(length in 0..payload.size)
         val data = DataOutputStream(output)
         data.writeByte(type.wireValue)
-        data.writeInt(payload.size)
-        data.write(payload)
-        data.flush()
+        data.writeInt(length)
+        data.write(payload, 0, length)
     }
 
     fun writeJson(output: OutputStream, type: FrameType, payload: JSONObject) =
         write(output, type, payload.toString().toByteArray())
 }
-

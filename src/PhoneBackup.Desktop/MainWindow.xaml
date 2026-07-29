@@ -437,6 +437,15 @@
                                         <Button Content="Выбрать папку"
                                                 Command="{Binding ChooseMediaDestinationCommand}"
                                                 HorizontalAlignment="Left"/>
+                                        <TextBlock Text="Транспорт данных"
+                                                   Style="{StaticResource LabelStyle}"
+                                                   Margin="0,18,0,6"/>
+                                        <ComboBox ItemsSource="{Binding MediaTransportOptions}"
+                                                  DisplayMemberPath="Label"
+                                                  SelectedValuePath="Key"
+                                                  SelectedValue="{Binding SelectedMediaTransport,
+                                                      Mode=TwoWay,
+                                                      UpdateSourceTrigger=PropertyChanged}"/>
                                         <Button Content="Скопировать все фото и видео"
                                                 Style="{StaticResource PrimaryButtonStyle}"
                                                 Command="{Binding ExportMediaCommand}"
@@ -455,7 +464,16 @@
                                             <TextBlock Text="✓ На телефоне ничего не удаляется"
                                                        TextWrapping="Wrap" Margin="0,0,0,8"/>
                                             <TextBlock Text="✓ Работает без root"
-                                                       TextWrapping="Wrap"/>
+                                                       TextWrapping="Wrap" Margin="0,0,0,14"/>
+                                            <Border Background="{DynamicResource InputBrush}"
+                                                    BorderBrush="{DynamicResource BorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="12"
+                                                    Padding="12">
+                                                <TextBlock Text="{Binding MediaLiveStats}"
+                                                           TextWrapping="Wrap"
+                                                           Foreground="{DynamicResource TextMutedBrush}"/>
+                                            </Border>
                                         </StackPanel>
                                     </Border>
                                     <TextBox Text="{Binding MediaExportReportText}"

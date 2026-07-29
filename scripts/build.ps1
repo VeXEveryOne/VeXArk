@@ -35,6 +35,7 @@ $javaHome = if ($env:JAVA_HOME) {
 }
 $embedded = Join-Path $projectRoot "src\PhoneBackup.Desktop\Embedded"
 $publish = Join-Path $projectRoot "artifacts\publish"
+$releaseArtifacts = Join-Path $projectRoot "artifacts\release"
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 $cargo = if ($cargoCommand) { $cargoCommand.Source } else { $null }
 if (-not $cargo) { $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe" }
@@ -81,7 +82,7 @@ Copy-Item (Join-Path $projectRoot "helper\target\aarch64-linux-android\release\p
 Push-Location (Join-Path $projectRoot "agent")
 try {
     $agentTask = if ($Configuration -eq "Release") { ":app:assembleRelease" } else { ":app:assembleDebug" }
-    & ".\gradlew.bat" $agentTask "--no-daemon"
+    & ".\gradlew.bat" ":app:testDebugUnitTest" $agentTask "--no-daemon"
     if ($LASTEXITCODE -ne 0) { throw "Сборка Android Agent завершилась ошибкой." }
 }
 finally {
@@ -96,6 +97,23 @@ $agentApk = if ($Configuration -eq "Release") {
     Join-Path $projectRoot "agent\app\build\outputs\apk\release\app-release.apk"
 } else {
     Join-Path $projectRoot "agent\app\build\outputs\apk\debug\app-debug.apk"
+}
+$apkMetadataPath = if ($Configuration -eq "Release") {
+    Join-Path $projectRoot "agent\app\build\outputs\apk\release\output-metadata.json"
+} else {
+    Join-Path $projectRoot "agent\app\build\outputs\apk\debug\output-metadata.json"
+}
+if (-not (Test-Path -LiteralPath $agentApk)) {
+    throw "Android Agent APK не найден: $agentApk"
+}
+if (-not (Test-Path -LiteralPath $apkMetadataPath)) {
+    throw "Метаданные Android Agent не найдены: $apkMetadataPath"
+}
+$projectVersion = ([xml](Get-Content -Raw (Join-Path $projectRoot "Directory.Build.props"))).Project.PropertyGroup.Version
+$apkMetadata = Get-Content -Raw $apkMetadataPath | ConvertFrom-Json
+$apkVersion = $apkMetadata.elements[0].versionName
+if ($apkVersion -ne $projectVersion) {
+    throw "Версия Android Agent ($apkVersion) не совпадает с версией desktop ($projectVersion)."
 }
 Copy-Item $agentApk `
     (Join-Path $embedded "phonebackup-agent.apk") -Force
@@ -126,6 +144,25 @@ Copy-Item (Join-Path $projectRoot "LICENSE") (Join-Path $publish "LICENSE.txt") 
 Copy-Item (Join-Path $projectRoot "NOTICE") (Join-Path $publish "NOTICE.txt") -Force
 
 $exe = Join-Path $publish "VeXArk.exe"
+if ($Configuration -eq "Release") {
+    New-Item -ItemType Directory -Force -Path $releaseArtifacts | Out-Null
+    $releaseExe = Join-Path $releaseArtifacts "VeXArk.exe"
+    $releaseApk = Join-Path $releaseArtifacts "VeXArk-Agent.apk"
+    Copy-Item $exe $releaseExe -Force
+    Copy-Item $agentApk $releaseApk -Force
+
+    $checksumPath = Join-Path $releaseArtifacts "SHA256SUMS.txt"
+    $checksumLines = @($releaseExe, $releaseApk) |
+        Sort-Object { Split-Path -Leaf $_ } |
+        ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $_)"
+        }
+    Set-Content -LiteralPath $checksumPath -Value $checksumLines -Encoding ascii
+}
 Write-Host ""
 Write-Host "Готово: $exe"
 Write-Host ("Размер: {0:N1} МБ" -f ((Get-Item $exe).Length / 1MB))
+if ($Configuration -eq "Release") {
+    Write-Host "Release-артефакты: $releaseArtifacts"
+}

@@ -11,6 +11,47 @@ and the project uses semantic versioning.
 - Stable signing and broader rooted-device validation.
 - Additional restore fixtures across Android 10–16 and multiple ROM families.
 
+## [0.7.0] — 2026-07-30
+
+### Added
+
+- Optional encrypted Fast LAN data channel for no-root MediaStore exports.
+- Automatic ADB, Fast Wi-Fi and destination-disk throughput probes.
+- Parallel media transfer with disk-aware worker selection and a 64 MiB buffer cap.
+- Resumable `.vexark.part` files with source metadata validation.
+- End-to-end SHA-256 verification for each transferred range.
+- Live transport, throughput, progress, ETA and active-file diagnostics.
+- Per-device Auto, Fast Wi-Fi and ADB transport preference.
+- Cross-language C# and Kotlin cryptographic protocol test vectors.
+
+### Changed
+
+- MediaStore reads now use reusable 1 MiB buffers and seekable descriptors.
+- ADB DATA frames no longer flush or allocate a second Android buffer per block.
+- ADB forwards are reused by media workers and removed when the client closes.
+- Media copies are preallocated and published atomically after verification.
+- Closing a Fast Wi-Fi listener or rejecting a malformed worker no longer lets
+  an executor exception terminate the Android Agent process.
+- Local release builds validate matching Desktop/Agent versions and regenerate
+  the EXE, APK and SHA-256 checksum bundle together.
+
+### Security
+
+- Fast LAN listeners bind only to the active private Wi-Fi address and exist
+  only for an authenticated, short-lived media session.
+- Worker and direction keys are separated with HKDF-SHA256; every record uses
+  AES-256-GCM with a replay-protected monotonic counter.
+- The direct LAN protocol is read-only and accepts only validated MediaStore
+  image/video URIs.
+
+### Verified
+
+- Xiaomi 13 (`fuxi`) with a custom ROM: 35.42 MiB/s through ADB and
+  44.82 MiB/s through Fast Wi-Fi.
+- Encrypted sample transfer, SHA-256 verification, LAN listener shutdown and
+  ADB-forward cleanup on the physical device.
+- Two consecutive Fast Wi-Fi session shutdowns without an Agent crash.
+
 ## [0.6.1] — 2026-07-29
 
 ### Added
@@ -112,7 +153,8 @@ and the project uses semantic versioning.
 - Android 10–16 no-root inventory and capability probing.
 - Versioned length-prefixed loopback protocol over `adb forward`.
 
-[Unreleased]: https://github.com/VeXEveryOne/VeXArk/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/VeXEveryOne/VeXArk/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.7.0
 [0.6.1]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.1
 [0.6.0]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.0
 [0.5.0]: https://github.com/VeXEveryOne/VeXArk/compare/v0.4.0...v0.5.0

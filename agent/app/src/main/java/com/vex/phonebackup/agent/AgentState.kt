@@ -15,6 +15,7 @@ data class RestoreApproval(
 
 object AgentState {
     var serviceRunning by mutableStateOf(false)
+    var fastTransferActive by mutableStateOf(false)
     var connectedClient by mutableStateOf<String?>(null)
     var pendingDesktopKey by mutableStateOf<String?>(null)
     var pendingRestore by mutableStateOf<RestoreApproval?>(null)

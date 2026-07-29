@@ -730,7 +730,8 @@ class MainActivity : ComponentActivity() {
             "Computer access revoked" to "Доступ компьютера отозван",
             "Restore confirmed" to "Restore подтверждён",
             "Restore rejected" to "Restore отклонён",
-            "Restore confirmation required" to "Требуется подтверждение Restore"
+            "Restore confirmation required" to "Требуется подтверждение Restore",
+            "Fast Wi-Fi transfer ready" to "Fast Wi-Fi готов к передаче"
         )
         exact[status]?.let { return it }
         return status

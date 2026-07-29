@@ -9,8 +9,19 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
+import java.io.FileInputStream
+import java.security.MessageDigest
+import kotlin.math.min
 
 object MediaStoreAccess {
+    data class ReadResult(
+        val sourceSize: Long,
+        val modifiedUnixNanos: Long,
+        val acceptedOffset: Long,
+        val transferredBytes: Long,
+        val sha256: String
+    )
+
     fun status(context: Context): JSONObject {
         val allFiles = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
         val images = allFiles || granted(
@@ -111,6 +122,82 @@ object MediaStoreAccess {
     }.isSuccess
 
     fun read(context: Context, value: String, emit: (ByteArray) -> Unit): Boolean = runCatching {
+        readV2(context, value, 0) { buffer, count ->
+            emit(if (count == buffer.size) buffer.copyOf() else buffer.copyOf(count))
+        }
+    }.isSuccess
+
+    fun readV2(
+        context: Context,
+        value: String,
+        requestedOffset: Long,
+        expectedSize: Long? = null,
+        expectedModifiedUnixNanos: Long? = null,
+        emit: (ByteArray, Int) -> Unit
+    ): ReadResult {
+        val uri = validateUri(context, value)
+        val metadata = metadata(context, uri)
+        if (expectedSize != null && expectedSize >= 0 && metadata.first != expectedSize)
+            error("MediaStore item size changed")
+        if (expectedModifiedUnixNanos != null &&
+            expectedModifiedUnixNanos > 0 &&
+            metadata.second != expectedModifiedUnixNanos)
+            error("MediaStore item timestamp changed")
+        require(requestedOffset in 0..metadata.first) { "resume offset is outside the media file" }
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        var transferred = 0L
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+            FileInputStream(descriptor.fileDescriptor).use { input ->
+                val channel = input.channel
+                val acceptedOffset = runCatching {
+                    channel.position(requestedOffset)
+                    channel.position()
+                }.getOrDefault(0)
+                require(acceptedOffset == requestedOffset) { "media file is not seekable" }
+                val buffer = ByteArray(DataBufferBytes)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (count == 0) continue
+                    digest.update(buffer, 0, count)
+                    emit(buffer, count)
+                    transferred += count
+                }
+            }
+        } ?: error("MediaStore item cannot be opened")
+        return ReadResult(
+            metadata.first,
+            metadata.second,
+            requestedOffset,
+            transferred,
+            digest.digest().toHex()
+        )
+    }
+
+    fun probe(length: Long, emit: (ByteArray, Int) -> Unit): ReadResult {
+        require(length in 0..ProbeLimitBytes) { "probe length is invalid" }
+        val buffer = ByteArray(DataBufferBytes) { index ->
+            ((index * 31 + 17) and 0xff).toByte()
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        var transferred = 0L
+        while (transferred < length) {
+            val count = min(buffer.size.toLong(), length - transferred).toInt()
+            digest.update(buffer, 0, count)
+            emit(buffer, count)
+            transferred += count
+        }
+        return ReadResult(
+            length,
+            0,
+            0,
+            transferred,
+            digest.digest().toHex()
+        )
+    }
+
+    private fun validateUri(context: Context, value: String): Uri {
         val uri = Uri.parse(value)
         require(uri.scheme == ContentResolverScheme && uri.authority == MediaAuthority)
         require(uri.pathSegments.firstOrNull() == MediaStore.VOLUME_EXTERNAL)
@@ -118,15 +205,28 @@ object MediaStoreAccess {
         require(mime.startsWith("image/") || mime.startsWith("video/")) {
             "content URI is not photo/video media"
         }
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            val buffer = ByteArray(256 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                emit(if (count == buffer.size) buffer.copyOf() else buffer.copyOf(count))
-            }
-        } ?: error("MediaStore item cannot be opened")
-    }.isSuccess
+        return uri
+    }
+
+    private fun metadata(context: Context, uri: Uri): Pair<Long, Long> {
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns.SIZE,
+            MediaStore.Files.FileColumns.DATE_MODIFIED
+        )
+        return context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+            require(cursor.moveToFirst()) { "MediaStore item is missing" }
+            Pair(
+                cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE))
+                    .coerceAtLeast(0),
+                cursor.getLong(
+                    cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED)
+                ).coerceAtLeast(0) * 1_000_000_000L
+            )
+        } ?: error("MediaStore metadata cannot be read")
+    }
+
+    private fun ByteArray.toHex(): String =
+        joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
 
     private fun safeName(value: String?, id: Long): String {
         val sanitized = value.orEmpty()
@@ -141,4 +241,6 @@ object MediaStoreAccess {
 
     private const val ContentResolverScheme = "content"
     private const val MediaAuthority = "media"
+    const val DataBufferBytes = 1024 * 1024
+    const val ProbeLimitBytes = 64L * 1024 * 1024
 }
