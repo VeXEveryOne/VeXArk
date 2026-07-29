@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text.Json;
 using PhoneBackup.Core;
 using PhoneBackup.Desktop;
@@ -58,6 +59,7 @@ await foreach (var entry in agent.ScanMediaAsync())
 var received = 0L;
 var adbProbeBytesPerSecond = 0d;
 var fastProbeBytesPerSecond = 0d;
+var fastSessionClosed = true;
 if (capabilities.Contains("media-export-v2"))
 {
     const long probeBytes = 16L * 1024 * 1024;
@@ -74,20 +76,44 @@ if (capabilities.Contains("media-export-v2"))
 
     if (capabilities.Contains("fast-lan-aead-v1"))
     {
-        await using var fast = await FastMediaClient.ConnectAsync(agent, 1);
-        fastProbeBytesPerSecond = await fast.Workers[0].ProbeAsync(
-            probeBytes,
-            CancellationToken.None);
-        if (sample is not null)
+        var fast = await FastMediaClient.ConnectAsync(agent, 1);
+        var fastSession = fast.Session;
+        try
         {
-            _ = await fast.Workers[0].CopyFileAsync(
-                sample.LinkTarget!,
-                0,
-                sample.Size,
-                sample.ModifiedUnixNanos,
-                Stream.Null,
-                count => received += count,
+            fastProbeBytesPerSecond = await fast.Workers[0].ProbeAsync(
+                probeBytes,
                 CancellationToken.None);
+            if (sample is not null)
+            {
+                _ = await fast.Workers[0].CopyFileAsync(
+                    sample.LinkTarget!,
+                    0,
+                    sample.Size,
+                    sample.ModifiedUnixNanos,
+                    Stream.Null,
+                    count => received += count,
+                    CancellationToken.None);
+            }
+        }
+        finally
+        {
+            await fast.DisposeAsync();
+        }
+
+        using var closedSessionProbe = new TcpClient();
+        using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            await closedSessionProbe.ConnectAsync(
+                fastSession.Host,
+                fastSession.Port,
+                closeTimeout.Token);
+            fastSessionClosed = false;
+        }
+        catch (Exception error) when (
+            error is SocketException or OperationCanceledException)
+        {
+            fastSessionClosed = true;
         }
     }
 }
@@ -112,6 +138,11 @@ if (sample is not null)
         return 6;
     }
 }
+if (!fastSessionClosed)
+{
+    Console.Error.WriteLine("Fast LAN listener remained open after session close.");
+    return 7;
+}
 
 Console.WriteLine(JsonSerializer.Serialize(new
 {
@@ -123,6 +154,7 @@ Console.WriteLine(JsonSerializer.Serialize(new
     accountCount,
     sampleBytes = received,
     adbProbeMiBps = adbProbeBytesPerSecond / 1024 / 1024,
-    fastProbeMiBps = fastProbeBytesPerSecond / 1024 / 1024
+    fastProbeMiBps = fastProbeBytesPerSecond / 1024 / 1024,
+    fastSessionClosed
 }));
 return 0;

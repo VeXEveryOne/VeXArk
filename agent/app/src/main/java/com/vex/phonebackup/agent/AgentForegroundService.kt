@@ -5,9 +5,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import org.json.JSONArray
+import java.io.EOFException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -77,7 +79,15 @@ class AgentForegroundService : Service() {
             AgentState.connectedClient = it.inetAddress.hostAddress
             AgentState.statusText = "PC connected"
             while (running.get() && !it.isClosed) {
-                val frame = runCatching { ProtocolFrameIo.read(it.getInputStream()) }.getOrNull() ?: break
+                val frame = try {
+                    ProtocolFrameIo.read(it.getInputStream())
+                } catch (_: EOFException) {
+                    break
+                } catch (failure: Exception) {
+                    Log.w(LOG_TAG, "Failed to read protocol frame", failure)
+                    AgentState.statusText = "Connection closed: invalid frame"
+                    break
+                }
                 if (frame.type != FrameType.COMMAND) {
                     error(it, "expected_command", "Expected COMMAND frame")
                     continue
@@ -547,5 +557,6 @@ class AgentForegroundService : Service() {
         const val KEY_TRUSTED = "trusted_desktop_keys"
         private const val NOTIFICATION_ID = 49321
         private const val RESTORE_APPROVAL_MILLIS = 120_000L
+        private const val LOG_TAG = "VeXArkAgent"
     }
 }

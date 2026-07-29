@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import org.json.JSONObject
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -122,7 +123,23 @@ object FastMediaSessionManager {
                         } catch (_: SocketTimeoutException) {
                             continue
                         }
-                        clients.execute { handle(socket) }
+                        clients.execute {
+                            runCatching { handle(socket) }
+                                .onFailure { failure ->
+                                    runCatching { socket.close() }
+                                    if (running.get()) {
+                                        Log.w(
+                                            LOG_TAG,
+                                            "Fast media worker closed after an error",
+                                            failure
+                                        )
+                                    }
+                                }
+                        }
+                    }
+                } catch (failure: Exception) {
+                    if (running.get() && !server.isClosed) {
+                        Log.w(LOG_TAG, "Fast media listener stopped unexpectedly", failure)
                     }
                 } finally {
                     synchronized(gate) {
@@ -256,4 +273,5 @@ object FastMediaSessionManager {
     private const val MAX_WORKERS = 4
     private const val HANDSHAKE_TIMEOUT_MILLIS = 5_000L
     private const val IDLE_TIMEOUT_MILLIS = 30_000L
+    private const val LOG_TAG = "VeXArkFastMedia"
 }

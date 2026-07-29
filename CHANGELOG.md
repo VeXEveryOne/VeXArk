@@ -11,7 +11,7 @@ and the project uses semantic versioning.
 - Stable signing and broader rooted-device validation.
 - Additional restore fixtures across Android 10–16 and multiple ROM families.
 
-## [0.7.0] — 2026-07-29
+## [0.7.0] — 2026-07-30
 
 ### Added
 
@@ -30,6 +30,10 @@ and the project uses semantic versioning.
 - ADB DATA frames no longer flush or allocate a second Android buffer per block.
 - ADB forwards are reused by media workers and removed when the client closes.
 - Media copies are preallocated and published atomically after verification.
+- Closing a Fast Wi-Fi listener or rejecting a malformed worker no longer lets
+  an executor exception terminate the Android Agent process.
+- Local release builds validate matching Desktop/Agent versions and regenerate
+  the EXE, APK and SHA-256 checksum bundle together.
 
 ### Security
 
@@ -39,6 +43,14 @@ and the project uses semantic versioning.
   AES-256-GCM with a replay-protected monotonic counter.
 - The direct LAN protocol is read-only and accepts only validated MediaStore
   image/video URIs.
+
+### Verified
+
+- Xiaomi 13 (`fuxi`) with a custom ROM: 35.42 MiB/s through ADB and
+  44.82 MiB/s through Fast Wi-Fi.
+- Encrypted sample transfer, SHA-256 verification, LAN listener shutdown and
+  ADB-forward cleanup on the physical device.
+- Two consecutive Fast Wi-Fi session shutdowns without an Agent crash.
 
 ## [0.6.1] — 2026-07-29
 

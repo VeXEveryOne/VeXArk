@@ -28,6 +28,7 @@ public sealed class FastMediaClient : IAsyncDisposable
     }
 
     public IReadOnlyList<FastMediaWorker> Workers => _workers;
+    public FastMediaSession Session => _session;
 
     public static async Task<FastMediaClient> ConnectAsync(
         AgentClient control,
