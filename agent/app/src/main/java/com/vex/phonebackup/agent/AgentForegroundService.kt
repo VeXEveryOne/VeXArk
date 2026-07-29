@@ -51,7 +51,7 @@ class AgentForegroundService : Service() {
     private fun startServer() {
         if (!running.compareAndSet(false, true)) return
         AgentState.serviceRunning = true
-        AgentState.statusText = "Waiting for ADB connection"
+        AgentState.statusText = "Waiting for VeXArk Desktop"
         acceptor.execute {
             try {
                 server = ServerSocket(PORT, 4, InetAddress.getLoopbackAddress())
@@ -111,7 +111,7 @@ class AgentForegroundService : Service() {
             }
             RootHelper.cleanup(this)
             AgentState.connectedClient = null
-            AgentState.statusText = "Waiting for ADB connection"
+            AgentState.statusText = "Waiting for VeXArk Desktop"
         }
     }
 

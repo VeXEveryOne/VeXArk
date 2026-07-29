@@ -125,7 +125,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set => Set(ref _statusText, value);
     }
     public string AppVersion =>
-        typeof(MainViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.6.0";
+        typeof(MainViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.6.1";
     public bool IsBusy { get => _isBusy; set => Set(ref _isBusy, value); }
     public DeviceViewModel? SelectedDevice { get => _selectedDevice; set { Set(ref _selectedDevice, value); Raise(nameof(PageSubtitle)); } }
     public SnapshotViewModel? SelectedSnapshot { get => _selectedSnapshot; set => Set(ref _selectedSnapshot, value); }

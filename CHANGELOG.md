@@ -11,6 +11,30 @@ and the project uses semantic versioning.
 - Stable signing and broader rooted-device validation.
 - Additional restore fixtures across Android 10–16 and multiple ROM families.
 
+## [0.6.1] — 2026-07-29
+
+### Added
+
+- Prominent Computer access card at the top of the Android Agent.
+- One-tap shortcut to Android Developer options with a best-effort request to
+  scroll to and highlight the USB debugging preference.
+- Clear three-step USB onboarding for first-time users.
+
+### Changed
+
+- Trusted, waiting, pending-approval and connected computer states now have
+  distinct high-visibility presentations.
+- New-computer fingerprint approval is displayed inside the primary access
+  card instead of a lower secondary section.
+- Waiting status now refers to VeXArk Desktop rather than implying that the
+  physical ADB connection itself is missing.
+
+### Verified
+
+- Developer settings deep-link and USB debugging highlight on Xiaomi 13
+  running a custom Android ROM.
+- Android debug build and in-place upgrade from Agent 0.4.0.
+
 ## [0.6.0] — 2026-07-28
 
 ### Added
@@ -88,11 +112,11 @@ and the project uses semantic versioning.
 - Android 10–16 no-root inventory and capability probing.
 - Versioned length-prefixed loopback protocol over `adb forward`.
 
-[Unreleased]: https://github.com/VeXEveryOne/VeXArk/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/VeXEveryOne/VeXArk/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.1
 [0.6.0]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.0
 [0.5.0]: https://github.com/VeXEveryOne/VeXArk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/VeXEveryOne/VeXArk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/VeXEveryOne/VeXArk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/VeXEveryOne/VeXArk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.1.0
-

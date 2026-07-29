@@ -79,7 +79,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: docs/releases/v0.6.0.md
+          body_path: docs/releases/${{ github.ref_name }}.md
           prerelease: true
           generate_release_notes: true
           files: |
