@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, develop, "feature/**", "fix/**"]
+    branches: [main, develop]
   pull_request:
     branches: [main, develop]
 
@@ -36,4 +36,3 @@ jobs:
       - name: Build debug APK
         working-directory: agent
         run: ./gradlew :app:assembleDebug --no-daemon
-
