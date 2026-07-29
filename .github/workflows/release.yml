@@ -70,7 +70,10 @@ jobs:
           Copy-Item artifacts\publish\VeXArk.exe artifacts\release\VeXArk.exe
           Copy-Item agent\app\build\outputs\apk\release\app-release.apk `
             artifacts\release\VeXArk-Agent.apk
-          $files = Get-ChildItem artifacts\release -File | Sort-Object Name
+          $files = @(
+            Get-Item artifacts\release\VeXArk-Agent.apk
+            Get-Item artifacts\release\VeXArk.exe
+          ) | Sort-Object Name
           $lines = $files | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           }
