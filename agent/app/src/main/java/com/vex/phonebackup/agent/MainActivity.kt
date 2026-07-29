@@ -1,6 +1,7 @@
 package com.vex.phonebackup.agent
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -178,6 +179,8 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
+                ComputerAccessCard()
+
                 SectionCard(tr("Language", "Язык")) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -218,25 +221,6 @@ class MainActivity : ComponentActivity() {
                     },
                     rootProbe.granted
                 )
-                StatusCard(
-                    tr("Connection", "Подключение"),
-                    localizedStatus(AgentState.statusText),
-                    AgentState.connectedClient != null
-                )
-
-                AgentState.pendingDesktopKey?.let { key ->
-                    ConfirmationCard(
-                        title = tr("New computer", "Новый компьютер"),
-                        text = tr("Verify fingerprint", "Сверьте fingerprint") +
-                            ": ${AgentState.fingerprint(key)}",
-                        approveLabel = tr("Allow", "Разрешить"),
-                        onApprove = { approveDesktop(key) },
-                        onReject = {
-                            AgentState.pendingDesktopKey = null
-                            AgentState.statusText = "Computer rejected"
-                        }
-                    )
-                }
 
                 AgentState.pendingRestore?.let { request ->
                     ConfirmationCard(
@@ -377,6 +361,206 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 14.dp)
                 )
+            }
+        }
+    }
+
+    @Composable
+    private fun ComputerAccessCard() {
+        val pendingKey = AgentState.pendingDesktopKey
+        val connected = AgentState.connectedClient != null
+        val containerColor = when {
+            pendingKey != null -> MaterialTheme.colorScheme.tertiaryContainer
+            connected -> MaterialTheme.colorScheme.secondaryContainer
+            else -> MaterialTheme.colorScheme.primaryContainer
+        }
+        val badgeColor = when {
+            pendingKey != null -> MaterialTheme.colorScheme.tertiary
+            connected -> MaterialTheme.colorScheme.primary
+            trustedKeys.isNotEmpty() -> MaterialTheme.colorScheme.primary
+            else -> MaterialTheme.colorScheme.error
+        }
+        val badgeText = when {
+            pendingKey != null -> tr("Action required", "Нужно подтверждение")
+            connected -> tr("Connected", "Подключён")
+            trustedKeys.isNotEmpty() -> tr("Waiting for PC", "Ожидание ПК")
+            else -> tr("Setup required", "Нужна настройка")
+        }
+
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.elevatedCardColors(containerColor = containerColor)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            tr("Computer access", "Доступ компьютера"),
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            localizedStatus(AgentState.statusText),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Surface(
+                        color = badgeColor,
+                        contentColor = MaterialTheme.colorScheme.surface,
+                        shape = MaterialTheme.shapes.extraLarge
+                    ) {
+                        Text(
+                            badgeText,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                when {
+                    pendingKey != null -> {
+                        Text(
+                            tr(
+                                "A computer wants to access VeXArk. Compare this fingerprint " +
+                                    "with the one shown in the Windows app:",
+                                "Компьютер запрашивает доступ к VeXArk. Сверьте этот fingerprint " +
+                                    "с указанным в приложении Windows:"
+                            )
+                        )
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                            shape = MaterialTheme.shapes.medium
+                        ) {
+                            Text(
+                                AgentState.fingerprint(pendingKey),
+                                modifier = Modifier.padding(16.dp),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Button(
+                                onClick = { approveDesktop(pendingKey) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(tr("Allow computer", "Разрешить компьютеру"))
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    AgentState.pendingDesktopKey = null
+                                    AgentState.statusText = "Computer rejected"
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(tr("Reject", "Отклонить"))
+                            }
+                        }
+                    }
+
+                    connected -> {
+                        Text(
+                            tr(
+                                "The desktop is connected through the local ADB tunnel. " +
+                                    "Backup commands can now be received securely.",
+                                "Компьютер подключён через локальный ADB-туннель. " +
+                                    "Теперь можно безопасно принимать команды резервного копирования."
+                            )
+                        )
+                        OutlinedButton(
+                            onClick = ::openUsbDebuggingSettings,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                tr(
+                                    "Open USB debugging settings",
+                                    "Открыть настройки USB-отладки"
+                                )
+                            )
+                        }
+                    }
+
+                    trustedKeys.isNotEmpty() -> {
+                        Text(
+                            if (language == "ru") {
+                                "Доверенных компьютеров: ${trustedKeys.size}. " +
+                                    "Подключите USB-кабель и откройте VeXArk в Windows. Если телефон " +
+                                    "не обнаружен, проверьте USB-отладку кнопкой ниже."
+                            } else {
+                                "This phone already trusts ${trustedKeys.size} " +
+                                    (if (trustedKeys.size == 1) "computer. " else "computers. ") +
+                                    "Connect the USB cable and open VeXArk on Windows. If the phone " +
+                                    "is not detected, check USB debugging below."
+                            }
+                        )
+                        Button(
+                            onClick = ::openUsbDebuggingSettings,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                tr(
+                                    "Open USB debugging settings",
+                                    "Открыть настройки USB-отладки"
+                                )
+                            )
+                        }
+                    }
+
+                    else -> {
+                        Text(
+                            tr(
+                                "Connect VeXArk in three steps:",
+                                "Подключите VeXArk за три шага:"
+                            ),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            tr(
+                                "1. Enable USB debugging.\n" +
+                                    "2. Connect the phone to the PC with a data cable.\n" +
+                                    "3. Tap Allow on Android's computer fingerprint prompt.",
+                                "1. Включите USB-отладку.\n" +
+                                    "2. Подключите телефон к ПК кабелем для передачи данных.\n" +
+                                    "3. Нажмите «Разрешить» в системном запросе fingerprint компьютера."
+                            )
+                        )
+                        Button(
+                            onClick = ::openUsbDebuggingSettings,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                tr(
+                                    "Open USB debugging settings",
+                                    "Открыть настройки USB-отладки"
+                                )
+                            )
+                        }
+                        Text(
+                            tr(
+                                "VeXArk opens Developer options and asks Android to highlight " +
+                                    "USB debugging. Some ROMs may ignore the highlight. If Developer " +
+                                    "options are hidden, tap the OS/build version seven times first.",
+                                "VeXArk откроет параметры разработчика и попросит Android выделить " +
+                                    "пункт USB-отладки. Некоторые прошивки могут проигнорировать " +
+                                    "выделение. Если меню скрыто, сначала семь раз нажмите на версию ОС/сборки."
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
         }
     }
@@ -539,7 +723,7 @@ class MainActivity : ComponentActivity() {
         if (language != "ru") return status
         val exact = mapOf(
             "Agent stopped" to "Agent остановлен",
-            "Waiting for ADB connection" to "Ожидание подключения через ADB",
+            "Waiting for VeXArk Desktop" to "Ожидание VeXArk Desktop",
             "PC connected" to "ПК подключён",
             "Computer rejected" to "Компьютер отклонён",
             "Computer trusted" to "Компьютер разрешён",
@@ -568,6 +752,22 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun openUsbDebuggingSettings() {
+        val fragmentArguments = Bundle().apply {
+            putString(SETTINGS_FRAGMENT_KEY, USB_DEBUGGING_PREFERENCE_KEY)
+        }
+        val developerSettings = Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+            putExtra(SETTINGS_FRAGMENT_KEY, USB_DEBUGGING_PREFERENCE_KEY)
+            putExtra(SETTINGS_FRAGMENT_ARGUMENTS, fragmentArguments)
+        }
+
+        try {
+            startActivity(developerSettings)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
     private fun granted(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) ==
             PackageManager.PERMISSION_GRANTED
@@ -575,5 +775,8 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val UI_PREFS = "vexark_ui"
         private const val KEY_LANGUAGE = "language"
+        private const val SETTINGS_FRAGMENT_ARGUMENTS = ":settings:show_fragment_args"
+        private const val SETTINGS_FRAGMENT_KEY = ":settings:fragment_args_key"
+        private const val USB_DEBUGGING_PREFERENCE_KEY = "enable_adb"
     }
 }
