@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, develop]
 
+concurrency:
+  group: build-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
