@@ -77,7 +77,7 @@ jobs:
           Set-Content artifacts\release\SHA256SUMS.txt $lines -Encoding ascii
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: docs/releases/${{ github.ref_name }}.md
           prerelease: false
