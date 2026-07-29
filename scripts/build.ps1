@@ -81,7 +81,7 @@ Copy-Item (Join-Path $projectRoot "helper\target\aarch64-linux-android\release\p
 Push-Location (Join-Path $projectRoot "agent")
 try {
     $agentTask = if ($Configuration -eq "Release") { ":app:assembleRelease" } else { ":app:assembleDebug" }
-    & ".\gradlew.bat" $agentTask "--no-daemon"
+    & ".\gradlew.bat" ":app:testDebugUnitTest" $agentTask "--no-daemon"
     if ($LASTEXITCODE -ne 0) { throw "Сборка Android Agent завершилась ошибкой." }
 }
 finally {

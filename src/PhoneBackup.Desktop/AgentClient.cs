@@ -17,13 +17,27 @@ public sealed class AgentClient : IAsyncDisposable
     private readonly NetworkStream _stream;
     private readonly DesktopIdentity _identity;
     private readonly string _desktopKey;
+    private readonly AdbService? _adb;
+    private readonly string? _serial;
+    private readonly int _forwardPort;
+    private readonly bool _ownsForward;
 
-    private AgentClient(TcpClient client, DesktopIdentity identity)
+    private AgentClient(
+        TcpClient client,
+        DesktopIdentity identity,
+        AdbService? adb,
+        string? serial,
+        int forwardPort,
+        bool ownsForward)
     {
         _client = client;
         _stream = client.GetStream();
         _identity = identity;
         _desktopKey = identity.PublicKey;
+        _adb = adb;
+        _serial = serial;
+        _forwardPort = forwardPort;
+        _ownsForward = ownsForward;
     }
 
     public static async Task<AgentClient> ConnectAsync(
@@ -33,6 +47,38 @@ public sealed class AgentClient : IAsyncDisposable
     {
         await adb.LaunchAgentAsync(serial, cancellationToken);
         var port = await adb.ForwardAgentPortAsync(serial, cancellationToken);
+        try
+        {
+            return await ConnectPortAsync(
+                port,
+                adb,
+                serial,
+                ownsForward: true,
+                cancellationToken);
+        }
+        catch
+        {
+            await adb.RemoveAgentForwardAsync(serial, port, CancellationToken.None);
+            throw;
+        }
+    }
+
+    public Task<AgentClient> ConnectSiblingAsync(
+        CancellationToken cancellationToken = default) =>
+        ConnectPortAsync(
+            _forwardPort,
+            adb: null,
+            serial: null,
+            ownsForward: false,
+            cancellationToken);
+
+    private static async Task<AgentClient> ConnectPortAsync(
+        int port,
+        AdbService? adb,
+        string? serial,
+        bool ownsForward,
+        CancellationToken cancellationToken)
+    {
         var client = new TcpClient { NoDelay = true };
         Exception? last = null;
         for (var attempt = 0; attempt < 20; attempt++)
@@ -40,7 +86,13 @@ public sealed class AgentClient : IAsyncDisposable
             try
             {
                 await client.ConnectAsync(IPAddress.Loopback, port, cancellationToken);
-                return new(client, DesktopIdentity.LoadOrCreate());
+                return new(
+                    client,
+                    DesktopIdentity.LoadOrCreate(),
+                    adb,
+                    serial,
+                    port,
+                    ownsForward);
             }
             catch (Exception error) when (error is SocketException or IOException)
             {
@@ -56,6 +108,19 @@ public sealed class AgentClient : IAsyncDisposable
 
     public Task<JsonDocument> HelloAsync(CancellationToken cancellationToken = default) =>
         SendCommandAsync("hello", cancellationToken: cancellationToken);
+
+    public async Task<IReadOnlySet<string>> GetCapabilitiesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        using var document = await HelloAsync(cancellationToken);
+        if (!document.RootElement.TryGetProperty("capabilities", out var capabilities))
+            return new HashSet<string>(StringComparer.Ordinal);
+        return capabilities.EnumerateArray()
+            .Select(x => x.GetString())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToHashSet(StringComparer.Ordinal);
+    }
 
     public Task<JsonDocument> PairAsync(CancellationToken cancellationToken = default) =>
         SendCommandAsync("pair", cancellationToken: cancellationToken);
@@ -418,6 +483,80 @@ public sealed class AgentClient : IAsyncDisposable
         return new RootReadStream(this);
     }
 
+    public async Task<AgentMediaReadStream> OpenMediaFileV2Async(
+        string contentUri,
+        long offset,
+        long expectedSize,
+        long expectedModifiedUnixNanos,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateMediaUri(contentUri);
+        if (offset < 0 || offset > expectedSize)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        var request = CreateSignedRequest("media_read_v2", new
+        {
+            uri = contentUri,
+            offset,
+            expectedSize,
+            expectedModifiedUnixNanos
+        });
+        await WriteFrameAsync(TransferFrameType.Command, request, cancellationToken);
+        return new(this);
+    }
+
+    public async Task<AgentMediaReadStream> OpenMediaProbeAsync(
+        long length,
+        CancellationToken cancellationToken = default)
+    {
+        if (length is < 0 or > 64L * 1024 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        var request = CreateSignedRequest("media_probe", new { length });
+        await WriteFrameAsync(TransferFrameType.Command, request, cancellationToken);
+        return new(this);
+    }
+
+    public async Task<FastMediaSession> OpenFastMediaSessionAsync(
+        byte[] sessionKey,
+        int workers,
+        CancellationToken cancellationToken = default)
+    {
+        if (sessionKey.Length != FastMediaProtocol.SessionKeyBytes)
+            throw new ArgumentException("Fast media session key must contain 32 bytes.", nameof(sessionKey));
+        using var response = await SendCommandAsync(
+            "media_session_open",
+            new
+            {
+                sessionKey = Convert.ToBase64String(sessionKey),
+                workers = Math.Clamp(workers, 1, 4)
+            },
+            cancellationToken);
+        if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+            throw new IOException(
+                response.RootElement.TryGetProperty("error", out var error)
+                    ? error.GetString()
+                    : "Agent could not open a Fast LAN session.");
+        var session = response.RootElement.GetProperty("session");
+        return new(
+            session.GetProperty("sessionId").GetString()
+                ?? throw new InvalidDataException("Fast LAN session ID is missing."),
+            session.GetProperty("host").GetString()
+                ?? throw new InvalidDataException("Fast LAN host is missing."),
+            session.GetProperty("port").GetInt32(),
+            DateTimeOffset.FromUnixTimeMilliseconds(
+                session.GetProperty("expiresAtUtcMillis").GetInt64()),
+            session.GetProperty("maxWorkers").GetInt32());
+    }
+
+    public async Task CloseFastMediaSessionAsync(
+        string sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        using var response = await SendCommandAsync(
+            "media_session_close",
+            new { sessionId },
+            cancellationToken);
+    }
+
     public async Task RestoreRootEntryAsync(
         string root,
         FileEntry entry,
@@ -537,9 +676,9 @@ public sealed class AgentClient : IAsyncDisposable
         var element = JsonSerializer.SerializeToElement(payload);
         using var buffer = new MemoryStream();
         using (var writer = new Utf8JsonWriter(buffer, new()
-               {
-                   Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-               }))
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        }))
             WriteCanonical(writer, element);
         // Android's org.json canonical string escaping includes forward slashes.
         var json = Encoding.UTF8.GetString(buffer.ToArray()).Replace("/", "\\/", StringComparison.Ordinal);
@@ -594,7 +733,6 @@ public sealed class AgentClient : IAsyncDisposable
         BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(1), payload.Length);
         await _stream.WriteAsync(header, cancellationToken);
         await _stream.WriteAsync(payload, cancellationToken);
-        await _stream.FlushAsync(cancellationToken);
     }
 
     private async Task<(TransferFrameType Type, byte[] Payload)> ReadFrameAsync(
@@ -616,9 +754,28 @@ public sealed class AgentClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await _stream.DisposeAsync();
-        _client.Dispose();
-        _identity.Dispose();
+        try
+        {
+            await _stream.DisposeAsync();
+        }
+        finally
+        {
+            _client.Dispose();
+            _identity.Dispose();
+            if (_ownsForward && _adb is not null && _serial is not null)
+                await _adb.RemoveAgentForwardAsync(
+                    _serial,
+                    _forwardPort,
+                    CancellationToken.None);
+        }
+    }
+
+    private static void ValidateMediaUri(string contentUri)
+    {
+        if (!Uri.TryCreate(contentUri, UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, "content", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(uri.Host, "media", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Некорректный MediaStore URI.", nameof(contentUri));
     }
 
     private static readonly JsonSerializerOptions AgentJsonOptions = new(JsonSerializerDefaults.Web);
@@ -662,6 +819,89 @@ public sealed class AgentClient : IAsyncDisposable
             _current.AsMemory(_offset, count).CopyTo(buffer);
             _offset += count;
             return count;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    public sealed class AgentMediaReadStream(AgentClient owner) : Stream
+    {
+        private int _remainingDataBytes;
+        private bool _completed;
+        private readonly TaskCompletionSource<MediaReadCompletion> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<MediaReadCompletion> Completion => _completion.Task;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (_completed) return 0;
+            if (buffer.Length == 0) return 0;
+            try
+            {
+                while (_remainingDataBytes == 0)
+                {
+                    var header = new byte[5];
+                    await owner._stream.ReadExactlyAsync(header, cancellationToken);
+                    var type = (TransferFrameType)header[0];
+                    var length = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1));
+                    var maximum = type == TransferFrameType.Data
+                        ? ProtocolConstants.DataFrameBytes
+                        : ProtocolConstants.MaxJsonFrameBytes;
+                    if (length < 0 || length > maximum)
+                        throw new InvalidDataException(
+                            $"Agent media frame length is invalid: {length}");
+                    if (type == TransferFrameType.Data)
+                    {
+                        _remainingDataBytes = length;
+                        if (length == 0) continue;
+                        break;
+                    }
+                    var payload = new byte[length];
+                    await owner._stream.ReadExactlyAsync(payload, cancellationToken);
+                    if (type == TransferFrameType.End)
+                    {
+                        using var document = JsonDocument.Parse(payload);
+                        var root = document.RootElement;
+                        var completion = new MediaReadCompletion(
+                            root.GetProperty("sourceSize").GetInt64(),
+                            root.GetProperty("modifiedUnixNanos").GetInt64(),
+                            root.GetProperty("acceptedOffset").GetInt64(),
+                            root.GetProperty("transferredBytes").GetInt64(),
+                            root.GetProperty("sha256").GetString() ?? string.Empty);
+                        _completed = true;
+                        _completion.TrySetResult(completion);
+                        return 0;
+                    }
+                    if (type == TransferFrameType.Error)
+                        throw new IOException(Encoding.UTF8.GetString(payload));
+                    if (type != TransferFrameType.Data)
+                        throw new InvalidDataException($"Unexpected media read frame: {type}");
+                }
+                var count = Math.Min(buffer.Length, _remainingDataBytes);
+                var read = await owner._stream.ReadAsync(buffer[..count], cancellationToken);
+                if (read == 0)
+                    throw new EndOfStreamException("Agent closed a media DATA frame early.");
+                _remainingDataBytes -= read;
+                return read;
+            }
+            catch (Exception error)
+            {
+                _completion.TrySetException(error);
+                throw;
+            }
         }
 
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
@@ -718,6 +958,13 @@ public sealed class AgentClient : IAsyncDisposable
 public sealed record SharedStorageCapability(
     bool AccessGranted,
     IReadOnlyList<string> Roots);
+
+public sealed record MediaReadCompletion(
+    long SourceSize,
+    long ModifiedUnixNanos,
+    long AcceptedOffset,
+    long TransferredBytes,
+    string Sha256);
 
 public sealed record PersonalDataCapability(
     bool Contacts,

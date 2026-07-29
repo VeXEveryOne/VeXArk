@@ -24,8 +24,8 @@ android {
         applicationId = "com.vex.phonebackup.agent"
         minSdk = 29
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.6.1"
+        versionCode = 8
+        versionName = "0.7.0"
     }
 
     buildTypes {
@@ -64,5 +64,6 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-alpha22")
     implementation("org.bouncycastle:bcprov-jdk18on:1.83")
     implementation("com.github.topjohnwu.libsu:core:6.0.0")
+    testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

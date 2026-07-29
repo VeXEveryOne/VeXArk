@@ -38,6 +38,7 @@ class AgentForegroundService : Service() {
     override fun onDestroy() {
         running.set(false)
         runCatching { server?.close() }
+        FastMediaSessionManager.closeAll()
         clients.shutdownNow()
         acceptor.shutdownNow()
         AgentState.serviceRunning = false
@@ -90,7 +91,7 @@ class AgentForegroundService : Service() {
                 if (request.optString("command") in setOf(
                         "root_scan", "root_read", "shared_scan", "shared_read",
                         "personal_export", "root_restore", "shared_restore",
-                        "media_scan", "media_read"
+                        "media_scan", "media_read", "media_read_v2", "media_probe"
                     )) {
                     runCatching { dispatchStreaming(it, request) }
                         .onFailure { failure ->
@@ -139,7 +140,8 @@ class AgentForegroundService : Service() {
                         "inventory", "packages", "pairing", "no-root", "shared-storage",
                         "personal-data", "root-scan", "root-read", "root-restore",
                         "shared-restore", "media-export", "account-inventory",
-                        "package-policy", "restore-approval"
+                        "package-policy", "restore-approval", "media-export-v2",
+                        "fast-lan-aead-v1"
                     )))
             }
             "pair" -> {
@@ -198,6 +200,26 @@ class AgentForegroundService : Service() {
             }
             "media_status" -> authorized(desktopKey, response) {
                 response.put("ok", true).put("permissions", MediaStoreAccess.status(this))
+            }
+            "media_session_open" -> authorized(desktopKey, response) {
+                val payload = request.optJSONObject("payload") ?: JSONObject()
+                val session = FastMediaSessionManager.open(
+                    this,
+                    desktopKey,
+                    payload.optString("sessionKey"),
+                    payload.optInt("workers", 4)
+                )
+                response.put("ok", true).put("session", session)
+                AgentState.statusText = "Fast Wi-Fi transfer ready"
+            }
+            "media_session_close" -> authorized(desktopKey, response) {
+                val sessionId = request.optJSONObject("payload")
+                    ?.optString("sessionId")
+                    ?.takeIf { it.isNotBlank() }
+                response.put(
+                    "ok",
+                    FastMediaSessionManager.close(desktopKey, sessionId)
+                )
             }
             "system_state" -> authorized(desktopKey, response) {
                 response.put("ok", true).put("state", SystemStateExporter.export(this))
@@ -311,6 +333,45 @@ class AgentForegroundService : Service() {
         }
         val payload = request.optJSONObject("payload") ?: JSONObject()
         val rootPath = payload.optString("root")
+        if (command == "media_read_v2" || command == "media_probe") {
+            val result = if (command == "media_probe") {
+                MediaStoreAccess.probe(payload.optLong("length", 0)) { buffer, count ->
+                    ProtocolFrameIo.write(
+                        socket.getOutputStream(),
+                        FrameType.DATA,
+                        buffer,
+                        count
+                    )
+                }
+            } else {
+                MediaStoreAccess.readV2(
+                    this,
+                    payload.optString("uri"),
+                    payload.optLong("offset", 0),
+                    payload.optLong("expectedSize", -1).takeIf { it >= 0 },
+                    payload.optLong("expectedModifiedUnixNanos", 0).takeIf { it > 0 }
+                ) { buffer, count ->
+                    ProtocolFrameIo.write(
+                        socket.getOutputStream(),
+                        FrameType.DATA,
+                        buffer,
+                        count
+                    )
+                }
+            }
+            ProtocolFrameIo.writeJson(
+                socket.getOutputStream(),
+                FrameType.END,
+                JSONObject()
+                    .put("ok", true)
+                    .put("sourceSize", result.sourceSize)
+                    .put("modifiedUnixNanos", result.modifiedUnixNanos)
+                    .put("acceptedOffset", result.acceptedOffset)
+                    .put("transferredBytes", result.transferredBytes)
+                    .put("sha256", result.sha256)
+            )
+            return
+        }
         val success = when (command) {
             "root_scan" -> RootHelper.scan(
                 this,

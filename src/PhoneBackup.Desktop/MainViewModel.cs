@@ -69,6 +69,7 @@ public sealed class PackageSelectionViewModel(PackageSnapshot package) : INotify
 public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly AdbService _adb = new();
+    private readonly Dictionary<string, string> _mediaTransports = new(StringComparer.Ordinal);
     private string _page = "devices";
     private string _statusText = "Готово";
     private bool _isBusy;
@@ -79,6 +80,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         "Копируются оригиналы из MediaStore. На телефоне ничего не удаляется.";
     private string _localCopyReportText =
         "Выбранный снимок можно сохранить одним зашифрованным файлом.";
+    private string _mediaLiveStats =
+        "Перед копированием Auto проверит ADB, Fast Wi-Fi и диск назначения.";
 
     public ObservableCollection<DeviceViewModel> Devices { get; } = [];
     public ObservableCollection<string> SnapshotLines { get; } = [];
@@ -125,9 +128,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set => Set(ref _statusText, value);
     }
     public string AppVersion =>
-        typeof(MainViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.6.1";
+        typeof(MainViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.7.0";
     public bool IsBusy { get => _isBusy; set => Set(ref _isBusy, value); }
-    public DeviceViewModel? SelectedDevice { get => _selectedDevice; set { Set(ref _selectedDevice, value); Raise(nameof(PageSubtitle)); } }
+    public DeviceViewModel? SelectedDevice
+    {
+        get => _selectedDevice;
+        set
+        {
+            Set(ref _selectedDevice, value);
+            Raise(nameof(PageSubtitle));
+            Raise(nameof(SelectedMediaTransport));
+        }
+    }
     public SnapshotViewModel? SelectedSnapshot { get => _selectedSnapshot; set => Set(ref _selectedSnapshot, value); }
     public string RestoreReportText
     {
@@ -147,6 +159,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         get => LocalizationManager.T(_localCopyReportText);
         set => Set(ref _localCopyReportText, value);
+    }
+    public string MediaLiveStats
+    {
+        get => LocalizationManager.T(_mediaLiveStats);
+        set => Set(ref _mediaLiveStats, value);
     }
 
     public bool BackupApps { get; set; } = true;
@@ -178,6 +195,33 @@ public sealed class MainViewModel : INotifyPropertyChanged
         new("en", "English"),
         new("ru", "Русский")
     ];
+    public IReadOnlyList<ChoiceOption> MediaTransportOptions =>
+    [
+        new("auto", LocalizationManager.IsRussian ? "Автоматически" : "Auto"),
+        new("fastlan", LocalizationManager.IsRussian ? "Быстрый Wi-Fi" : "Fast Wi-Fi"),
+        new("adb", "ADB")
+    ];
+    public string SelectedMediaTransport
+    {
+        get
+        {
+            var deviceId = SelectedDevice?.Inventory.StableId;
+            return deviceId is not null && _mediaTransports.TryGetValue(deviceId, out var value)
+                ? DesktopSettingsStore.NormalizeMediaTransport(value)
+                : "auto";
+        }
+        set
+        {
+            var deviceId = SelectedDevice?.Inventory.StableId;
+            if (deviceId is null) return;
+            var normalized = DesktopSettingsStore.NormalizeMediaTransport(value);
+            if (_mediaTransports.TryGetValue(deviceId, out var current) && current == normalized)
+                return;
+            _mediaTransports[deviceId] = normalized;
+            SaveDesktopSettings();
+            Raise();
+        }
+    }
     public string SelectedTheme
     {
         get => ThemeManager.SelectedTheme;
@@ -537,18 +581,56 @@ public sealed class MainViewModel : INotifyPropertyChanged
                     "media-copy" => value.Total > 0
                         ? $"Копирование {value.Completed + 1}/{value.Total}: {value.Item}"
                         : $"Копирование: {value.Item}",
+                    "media-probe" => value.Item,
+                    "media-fallback" => value.Item,
                     _ => value.Item
                 };
             });
+            var transferMetrics = new Progress<MediaTransferMetrics>(value =>
+            {
+                var transport = value.Transport == MediaTransportMode.FastLan
+                    ? (LocalizationManager.IsRussian ? "Быстрый Wi-Fi" : "Fast Wi-Fi")
+                    : "ADB";
+                var eta = value.EstimatedRemaining is { } remaining &&
+                          remaining > TimeSpan.Zero
+                    ? (LocalizationManager.IsRussian
+                        ? $"осталось ~{FormatDuration(remaining)}"
+                        : $"~{FormatDuration(remaining)} remaining")
+                    : (LocalizationManager.IsRussian ? "завершение" : "finishing");
+                MediaLiveStats =
+                    $"{transport} • {FormatRate(value.BytesPerSecond)} • " +
+                    $"{(LocalizationManager.IsRussian ? "диск" : "disk")} " +
+                    $"{FormatRate(value.DiskBytesPerSecond)}\n" +
+                    $"{FormatBytes(value.CompletedBytes)} / {FormatBytes(value.TotalBytes)} • " +
+                    $"{eta} • {value.ActiveFiles} " +
+                    $"{(LocalizationManager.IsRussian ? "активных файлов" : "active files")}";
+            });
+            var selectedMode = SelectedMediaTransport switch
+            {
+                "fastlan" => MediaTransportMode.FastLan,
+                "adb" => MediaTransportMode.Adb,
+                _ => MediaTransportMode.Auto
+            };
             var report = await new MediaExportCoordinator().ExportAsync(
                 agent,
                 MediaDestination,
-                transferProgress);
+                new(selectedMode),
+                transferProgress,
+                transferMetrics);
+            var transportName = report.Transport == MediaTransportMode.FastLan
+                ? (LocalizationManager.IsRussian ? "Быстрый Wi-Fi" : "Fast Wi-Fi")
+                : "ADB";
             MediaExportReportText =
                 $"Скопировано: {report.CopiedFiles} ({FormatBytes(report.CopiedBytes)})\n" +
                 $"Уже было на ПК: {report.SkippedFiles}\n" +
+                $"Продолжено: {report.ResumedFiles} ({FormatBytes(report.ResumedBytes)})\n" +
                 $"Ошибок: {report.FailedFiles}\n" +
-                $"Всего найдено: {FormatBytes(report.TotalBytes)}" +
+                $"Всего найдено: {FormatBytes(report.TotalBytes)}\n" +
+                $"Транспорт: {transportName}, workers: {report.WorkerCount}\n" +
+                $"Средняя скорость: {FormatRate(report.AverageBytesPerSecond)}\n" +
+                $"Тесты: ADB {FormatRate(report.AdbProbeBytesPerSecond)}, " +
+                $"Fast Wi-Fi {FormatRate(report.FastLanProbeBytesPerSecond)}, " +
+                $"диск {FormatRate(report.DiskBytesPerSecond)}" +
                 (report.Errors.Count == 0
                     ? string.Empty
                     : "\n\nПервые ошибки:\n" + string.Join("\n", report.Errors.Take(10)));
@@ -860,6 +942,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var settings = DesktopSettingsStore.Load();
         RepositoryPath = settings.RepositoryPath;
         MediaDestination = settings.MediaDestination;
+        _mediaTransports.Clear();
+        foreach (var item in settings.MediaTransports)
+            _mediaTransports[item.Key] = item.Value;
     }
 
     private void SaveDesktopSettings()
@@ -868,13 +953,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RepositoryPath,
             MediaDestination,
             ThemeManager.SelectedTheme,
-            LocalizationManager.Language));
+            LocalizationManager.Language,
+            new Dictionary<string, string>(_mediaTransports, StringComparer.Ordinal)));
     }
 
     private static string FormatBytes(long value) =>
         value >= 1024L * 1024 * 1024
             ? $"{value / 1024d / 1024 / 1024:0.##} {LocalizationManager.T("ГБ")}"
             : $"{value / 1024d / 1024:0.##} {LocalizationManager.T("МБ")}";
+
+    private static string FormatRate(double value) =>
+        value <= 0 ? "—" : $"{value / 1024d / 1024:0.0} MB/s";
+
+    private static string FormatDuration(TimeSpan value) =>
+        value.TotalHours >= 1
+            ? $"{(int)value.TotalHours}:{value.Minutes:00}:{value.Seconds:00}"
+            : $"{value.Minutes}:{value.Seconds:00}";
 
     public void RefreshLocalization()
     {
@@ -883,11 +977,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Raise(nameof(StatusText));
         Raise(nameof(RestoreReportText));
         Raise(nameof(MediaExportReportText));
+        Raise(nameof(MediaLiveStats));
         Raise(nameof(LocalCopyReportText));
         Raise(nameof(DevicesFoundLabel));
         Raise(nameof(VersionLabel));
         Raise(nameof(ThemeOptions));
         Raise(nameof(LanguageOptions));
+        Raise(nameof(MediaTransportOptions));
+        Raise(nameof(SelectedMediaTransport));
         Raise(nameof(SelectedLanguage));
         Raise(nameof(SelectedTheme));
         PopulateSnapshots(Snapshots.Select(x => x.Manifest).ToArray());

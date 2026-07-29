@@ -5,7 +5,7 @@
   <p>
     <a href="../README.md">English</a> ·
     <a href="https://vexeveryone.github.io/VeXArk/">Сайт</a> ·
-    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.6.1">Скачать</a> ·
+    <a href="https://github.com/VeXEveryOne/VeXArk/releases/tag/v0.7.0">Скачать</a> ·
     <a href="../CHANGELOG.md">История версий</a>
   </p>
 </div>
@@ -25,9 +25,9 @@ root-helper. Без root доступны инвентаризация, APK/spli
 
 | Платформа | Файл | Требования |
 | --- | --- | --- |
-| Windows | [Скачать `VeXArk.exe`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/VeXArk.exe) | Windows 10/11 x64 |
-| Android | [Скачать `VeXArk-Agent.apk`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/VeXArk-Agent.apk) | Android 10–16, arm64-v8a |
-| Хеши | [`SHA256SUMS.txt`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.6.1/SHA256SUMS.txt) | Для проверки файлов |
+| Windows | [Скачать `VeXArk.exe`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/VeXArk.exe) | Windows 10/11 x64 |
+| Android | [Скачать `VeXArk-Agent.apk`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/VeXArk-Agent.apk) | Android 10–16, arm64-v8a |
+| Хеши | [`SHA256SUMS.txt`](https://github.com/VeXEveryOne/VeXArk/releases/download/v0.7.0/SHA256SUMS.txt) | Для проверки файлов |
 
 Windows-клиент portable: внутри уже лежат совместимый Agent и ADB. Установка и
 права администратора не нужны.
@@ -36,6 +36,8 @@ Windows-клиент portable: внутри уже лежат совместим
 
 - Полностью офлайн, без аккаунта, телеметрии и облака.
 - Копирование всех фото и видео в обычную папку Windows без root.
+- Fast Wi-Fi с автоматическим сравнением скорости ADB, локальной сети и диска.
+- До четырёх параллельных worker-ов и продолжение прерванных файлов.
 - Зашифрованные переносимые файлы `.vexark`.
 - Инкрементальные снимки и дедупликация неизменившихся блоков.
 - Argon2id, AES-256-GCM, случайный master key и recovery key из 24 слов.

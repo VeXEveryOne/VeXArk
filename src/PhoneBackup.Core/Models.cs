@@ -13,6 +13,7 @@ public static class ProtocolConstants
 public enum RootState { Unavailable, Available, Granted, Denied }
 public enum BackupMode { Portable, Full }
 public enum CompatibilityLevel { Safe, Conditional, Blocked }
+public enum MediaTransportMode { Auto, Adb, FastLan }
 public enum TransferFrameType : byte
 {
     Command = 1, Response = 2, FileMetadata = 3, Data = 4,
@@ -158,6 +159,29 @@ public sealed record RepositoryHeader(
     string CompressionAlgorithm);
 
 public sealed record TransferProgress(string Stage, string Item, long Completed, long Total);
+
+public sealed record MediaTransferOptions(
+    MediaTransportMode Transport,
+    int AdbWorkers = 2,
+    int FastLanWorkers = 4,
+    long BufferBudgetBytes = 64L * 1024 * 1024);
+
+public sealed record MediaTransferMetrics(
+    MediaTransportMode Transport,
+    double BytesPerSecond,
+    double DiskBytesPerSecond,
+    long CompletedBytes,
+    long TotalBytes,
+    long ResumedBytes,
+    int ActiveFiles,
+    TimeSpan? EstimatedRemaining);
+
+public sealed record FastMediaSession(
+    string SessionId,
+    string Host,
+    int Port,
+    DateTimeOffset ExpiresAtUtc,
+    int MaxWorkers);
 
 public sealed record ProtocolEnvelope(
     int ProtocolVersion,

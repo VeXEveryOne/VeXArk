@@ -109,6 +109,19 @@ public sealed partial class AdbService
         return port;
     }
 
+    public async Task RemoveAgentForwardAsync(
+        string serial,
+        int localPort,
+        CancellationToken cancellationToken = default)
+    {
+        if (localPort is <= 0 or > 65535)
+            return;
+        _ = await RunAsync(
+            ["-s", serial, "forward", "--remove", $"tcp:{localPort}"],
+            cancellationToken,
+            throwOnError: false);
+    }
+
     public const string AgentPackage = "com.vex.phonebackup.agent";
 
     public async Task InstallMultipleAsync(
