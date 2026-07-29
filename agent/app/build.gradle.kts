@@ -61,7 +61,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.11.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.compose.material3:material3:1.5.0-alpha22")
+    implementation("androidx.compose.material3:material3:1.5.0-alpha25")
     implementation("org.bouncycastle:bcprov-jdk18on:1.83")
     implementation("com.github.topjohnwu.libsu:core:6.0.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
