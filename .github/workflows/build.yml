@@ -18,8 +18,8 @@ jobs:
     name: Windows and core tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "9.0.x"
       - name: Test core
@@ -31,12 +31,12 @@ jobs:
     name: Android Agent
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: Test and build debug APK
         working-directory: agent
         run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
