@@ -80,6 +80,8 @@ object SharedStorageAccess {
         relative: String,
         kind: String,
         modifiedUnixNanos: Long,
+        expectedSize: Long,
+        expectedBlake3: String?,
         consume: (OutputStream) -> Unit
     ): Boolean = runCatching {
         requireAccess()
@@ -95,14 +97,29 @@ object SharedStorageAccess {
         }
         when (kind) {
             "directory" -> {
-                OutputStream.nullOutputStream().use(consume)
+                object : OutputStream() {
+                    override fun write(value: Int) = Unit
+                }.use(consume)
                 require(target.mkdirs() || target.isDirectory)
             }
             "file" -> {
                 require(target.parentFile?.mkdirs() == true || target.parentFile?.isDirectory == true)
                 val temporary = File(target.parentFile, ".${target.name}.phonebackup-${System.nanoTime()}")
                 try {
-                    FileOutputStream(temporary).buffered(256 * 1024).use(consume)
+                    val actualHash = FileOutputStream(temporary).buffered(256 * 1024).use { output ->
+                        val hashing = Blake3OutputStream(output)
+                        consume(hashing)
+                        hashing.flush()
+                        hashing.finalHex()
+                    }
+                    require(expectedSize < 0 || temporary.length() == expectedSize) {
+                        "restored file size mismatch"
+                    }
+                    require(expectedBlake3.isNullOrBlank() ||
+                        expectedBlake3.matches(Regex("^[0-9a-fA-F]{64}$")) &&
+                        actualHash.equals(expectedBlake3, ignoreCase = true)) {
+                        "restored file BLAKE3 mismatch"
+                    }
                     require(temporary.renameTo(target)) { "cannot publish restored file" }
                 } finally {
                     temporary.delete()

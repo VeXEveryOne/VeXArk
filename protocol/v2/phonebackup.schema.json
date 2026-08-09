@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexark.local/protocol/v2/phonebackup.schema.json",
+  "title": "VeXArk Agent Protocol v2 request",
+  "type": "object",
+  "required": [
+    "protocolVersion", "requestId", "command", "desktopKey",
+    "timestamp", "nonce", "payloadHash", "signature", "payload"
+  ],
+  "properties": {
+    "protocolVersion": { "const": 2 },
+    "command": { "type": "string", "minLength": 1 },
+    "requestId": { "type": "string", "format": "uuid" },
+    "desktopKey": { "type": "string", "contentEncoding": "base64" },
+    "timestamp": { "type": "integer" },
+    "nonce": { "type": "string", "contentEncoding": "base64" },
+    "payloadHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "signature": { "type": "string", "contentEncoding": "base64" },
+    "payload": { "type": ["object", "null"] }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexark.local/protocol/v2/snapshot.schema.json",
+  "title": "VeXArk Snapshot Manifest v2",
+  "type": "object",
+  "required": [
+    "formatVersion", "snapshotId", "createdAtUtc", "mode", "device",
+    "components", "excludedMedia", "purpose", "summary"
+  ],
+  "properties": {
+    "formatVersion": { "const": 2 },
+    "snapshotId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "createdAtUtc": { "type": "string", "format": "date-time" },
+    "mode": { "enum": ["Portable", "Full", 0, 1] },
+    "device": { "$ref": "#/$defs/device" },
+    "rom": { "oneOf": [{ "$ref": "#/$defs/romIdentity" }, { "type": "null" }] },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "kind", "files", "plainBytes", "storedBytes", "status",
+          "restoreClass", "schemaVersion", "userId", "dataRootKind"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "minLength": 1 },
+          "files": { "type": "array", "items": { "$ref": "#/$defs/fileEntry" } },
+          "plainBytes": { "type": "integer", "minimum": 0 },
+          "storedBytes": { "type": "integer", "minimum": 0 },
+          "package": { "type": ["object", "null"] },
+          "status": { "enum": ["Unknown", "Complete", "Partial", "Skipped", "Failed", 0, 1, 2, 3, 4] },
+          "restoreClass": { "enum": ["Portable", "ExactRom", "ExactDevice", "ArchiveOnly", "Never", 0, 1, 2, 3, 4] },
+          "schemaId": { "type": ["string", "null"] },
+          "schemaVersion": { "type": "integer", "minimum": 1 },
+          "userId": { "type": "integer", "minimum": 0 },
+          "dataRootKind": { "enum": ["Unknown", "CredentialEncrypted", "DeviceEncrypted", "ExternalData", "Obb", 0, 1, 2, 3, 4] },
+          "failures": {
+            "type": ["array", "null"],
+            "items": { "$ref": "#/$defs/componentFailure" }
+          },
+          "verification": {
+            "oneOf": [{ "$ref": "#/$defs/verification" }, { "type": "null" }]
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [{
+          "if": { "properties": { "status": { "enum": ["Complete", 1] } } },
+          "then": {
+            "properties": {
+              "verification": {
+                "allOf": [
+                  { "$ref": "#/$defs/verification" },
+                  { "properties": { "hashesVerified": { "const": true } } }
+                ]
+              }
+            }
+          }
+        }]
+      }
+    },
+    "excludedMedia": { "$ref": "#/$defs/excludedMedia" },
+    "purpose": { "enum": ["manual", "safety"] },
+    "summary": { "$ref": "#/$defs/summary" }
+  },
+  "$defs": {
+    "device": {
+      "type": "object",
+      "required": [
+        "stableId", "model", "device", "androidVersion", "sdk", "fingerprint",
+        "abi", "selinux", "root", "transports", "dataTotalBytes", "dataAvailableBytes"
+      ],
+      "properties": {
+        "stableId": { "type": "string", "minLength": 1 },
+        "model": { "type": "string" },
+        "device": { "type": "string", "minLength": 1 },
+        "androidVersion": { "type": "string" },
+        "sdk": { "type": "integer", "minimum": 1 },
+        "fingerprint": { "type": "string" },
+        "abi": { "type": "string" },
+        "selinux": { "type": "string" },
+        "root": { "enum": ["Unavailable", "Available", "Granted", "Denied", 0, 1, 2, 3] },
+        "transports": { "type": "array", "items": { "type": "object" } },
+        "dataTotalBytes": { "type": "integer", "minimum": 0 },
+        "dataAvailableBytes": { "type": "integer", "minimum": 0 },
+        "rom": { "oneOf": [{ "$ref": "#/$defs/romIdentity" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "romIdentity": {
+      "type": "object",
+      "required": [
+        "sdk", "device", "buildIncremental", "providerSchemaVersions",
+        "packageSignatures", "capabilities"
+      ],
+      "properties": {
+        "sdk": { "type": "integer", "minimum": 1 },
+        "device": { "type": "string", "minLength": 1 },
+        "buildIncremental": { "type": "string" },
+        "crDroidVersion": { "type": ["string", "null"] },
+        "crDroidBuildVersion": { "type": ["string", "null"] },
+        "lineageDevice": { "type": ["string", "null"] },
+        "providerSchemaVersions": {
+          "type": "object", "additionalProperties": { "type": "integer" }
+        },
+        "packageSignatures": {
+          "type": "object", "additionalProperties": { "type": "string" }
+        },
+        "capabilities": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "packageVersions": {
+          "type": ["object", "null"], "additionalProperties": { "type": "integer" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "status", "completeComponents", "partialComponents", "failedComponents",
+        "skippedComponents", "warnings"
+      ],
+      "properties": {
+        "status": { "enum": ["Unknown", "Complete", "Partial", "Skipped", "Failed", 0, 1, 2, 3, 4] },
+        "completeComponents": { "type": "integer", "minimum": 0 },
+        "partialComponents": { "type": "integer", "minimum": 0 },
+        "failedComponents": { "type": "integer", "minimum": 0 },
+        "skippedComponents": { "type": "integer", "minimum": 0 },
+        "warnings": { "type": "array", "items": { "type": "string" }, "maxItems": 100 }
+      },
+      "additionalProperties": false
+    },
+    "excludedMedia": {
+      "type": "object",
+      "required": ["fileCount", "totalBytes", "samples"],
+      "properties": {
+        "fileCount": { "type": "integer", "minimum": 0 },
+        "totalBytes": { "type": "integer", "minimum": 0 },
+        "samples": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "componentFailure": {
+      "type": "object",
+      "required": ["stage", "errorCode", "message"],
+      "properties": {
+        "stage": { "type": "string" },
+        "relativePath": { "type": ["string", "null"] },
+        "errorCode": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "required": [
+        "expectedFiles", "capturedFiles", "expectedBytes", "capturedBytes", "hashesVerified"
+      ],
+      "properties": {
+        "expectedFiles": { "type": "integer", "minimum": 0 },
+        "capturedFiles": { "type": "integer", "minimum": 0 },
+        "expectedBytes": { "type": "integer", "minimum": 0 },
+        "capturedBytes": { "type": "integer", "minimum": 0 },
+        "hashesVerified": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "fileEntry": {
+      "type": "object",
+      "required": [
+        "relativePath", "kind", "size", "modifiedUnixNanos", "mode", "uid", "gid"
+      ],
+      "properties": {
+        "relativePath": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["file", "directory", "symlink", "special"] },
+        "size": { "type": "integer", "minimum": 0 },
+        "modifiedUnixNanos": { "type": "integer" },
+        "mode": { "type": "integer" },
+        "uid": { "type": "integer" },
+        "gid": { "type": "integer" },
+        "selinuxLabel": { "type": ["string", "null"] },
+        "linkTarget": { "type": ["string", "null"] },
+        "contentHash": { "type": ["string", "null"] },
+        "chunks": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/chunkReference" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "chunkReference": {
+      "type": "object",
+      "required": ["objectId", "plainLength", "storedLength"],
+      "properties": {
+        "objectId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "plainLength": { "type": "integer", "minimum": 1 },
+        "storedLength": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

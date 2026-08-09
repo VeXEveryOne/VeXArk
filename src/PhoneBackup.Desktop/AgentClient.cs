@@ -66,6 +66,7 @@ public sealed record AgentDiagnosticsSnapshot(
 
 public sealed class AgentClient : IAsyncDisposable
 {
+    private static readonly TimeSpan ProtocolIdleTimeout = TimeSpan.FromMinutes(2);
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly DesktopIdentity _identity;
@@ -226,11 +227,25 @@ public sealed class AgentClient : IAsyncDisposable
     public Task<JsonDocument> InventoryAsync(CancellationToken cancellationToken = default) =>
         SendCommandAsync("inventory", cancellationToken: cancellationToken);
 
+    public async Task<RomIdentity?> GetRomIdentityAsync(
+        CancellationToken cancellationToken = default)
+    {
+        using var document = await InventoryAsync(cancellationToken).ConfigureAwait(false);
+        EnsureOk(document.RootElement, "inventory");
+        if (!document.RootElement.TryGetProperty("inventory", out var inventory) ||
+            !inventory.TryGetProperty("romIdentity", out var identity) ||
+            identity.ValueKind != JsonValueKind.Object)
+            return null;
+        return ParseRomIdentity(identity);
+    }
+
     public Task<JsonDocument> PackagesAsync(
         bool includeSystemApps = false,
         IReadOnlyCollection<string>? packageNames = null,
-        CancellationToken cancellationToken = default) =>
-        SendCommandAsync("packages", new { includeSystemApps, packageNames }, cancellationToken);
+        CancellationToken cancellationToken = default,
+        bool hashArtifacts = true) =>
+        SendCommandAsync(
+            "packages", new { includeSystemApps, packageNames, hashArtifacts }, cancellationToken);
 
     public async Task<bool> PairWithApprovalAsync(
         TimeSpan timeout,
@@ -252,9 +267,12 @@ public sealed class AgentClient : IAsyncDisposable
     public async Task<IReadOnlyList<PackageSnapshot>> GetPackagesAsync(
         bool includeSystemApps = false,
         IReadOnlyCollection<string>? packageNames = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool hashArtifacts = true)
     {
-        using var document = await PackagesAsync(includeSystemApps, packageNames, cancellationToken);
+        using var document = await PackagesAsync(
+            includeSystemApps, packageNames, cancellationToken, hashArtifacts)
+            .ConfigureAwait(false);
         if (!document.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
             throw new InvalidOperationException(
                 document.RootElement.TryGetProperty("error", out var error)
@@ -273,6 +291,24 @@ public sealed class AgentClient : IAsyncDisposable
                 .ToList();
             var dataPaths = item.GetProperty("dataPaths").EnumerateArray()
                 .Select(x => x.GetString() ?? string.Empty).Where(x => x.Length > 0).ToList();
+            var dataRoots = item.TryGetProperty("dataRoots", out var rootItems) &&
+                            rootItems.ValueKind == JsonValueKind.Array
+                ? rootItems.EnumerateArray().Select(x => new AppDataRoot(
+                    ParseDataRootKind(x.GetProperty("kind").GetString()),
+                    x.GetProperty("path").GetString() ?? string.Empty,
+                    x.TryGetProperty("userId", out var rootUser) ? rootUser.GetInt32() : 0))
+                    .Where(x => x.Path.Length > 0)
+                    .ToList()
+                : dataPaths.Select((path, index) => new AppDataRoot(
+                    index == 0 ? DataRootKind.CredentialEncrypted :
+                    index == 1 ? DataRootKind.DeviceEncrypted : DataRootKind.Unknown,
+                    path,
+                    0)).ToList();
+            var signingLineage = item.TryGetProperty("signingLineageSha256", out var lineage) &&
+                                 lineage.ValueKind == JsonValueKind.Array
+                ? lineage.EnumerateArray().Select(x => x.GetString())
+                    .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToList()
+                : [];
             var runtimePermissions = item.TryGetProperty("runtimePermissions", out var permissionItems)
                 ? permissionItems.EnumerateArray()
                     .Select(x => new RuntimePermissionState(
@@ -290,7 +326,7 @@ public sealed class AgentClient : IAsyncDisposable
                 item.TryGetProperty("installer", out var installer) && installer.ValueKind != JsonValueKind.Null
                     ? installer.GetString()
                     : null,
-                0,
+                item.TryGetProperty("userId", out var userId) ? userId.GetInt32() : 0,
                 item.GetProperty("uid").GetInt32(),
                 item.GetProperty("isSystem").GetBoolean(),
                 item.GetProperty("isEnabled").GetBoolean(),
@@ -298,10 +334,70 @@ public sealed class AgentClient : IAsyncDisposable
                 dataPaths,
                 runtimePermissions,
                 item.TryGetProperty("batteryOptimizationExempt", out var battery) &&
-                battery.GetBoolean()));
+                battery.GetBoolean(),
+                dataRoots,
+                signingLineage,
+                item.TryGetProperty("targetSdk", out var targetSdk) ? targetSdk.GetInt32() : 0,
+                item.TryGetProperty("appLocales", out var locales) &&
+                locales.ValueKind == JsonValueKind.String ? locales.GetString() : null));
         }
         return result;
     }
+
+    internal static RomIdentity ParseRomIdentity(JsonElement identity)
+    {
+        var schemas = identity.TryGetProperty("providerSchemaVersions", out var schemaItems) &&
+                      schemaItems.ValueKind == JsonValueKind.Object
+            ? schemaItems.EnumerateObject().ToDictionary(
+                x => x.Name,
+                x => x.Value.GetInt32(),
+                StringComparer.Ordinal)
+            : new Dictionary<string, int>(StringComparer.Ordinal);
+        var signatures = identity.TryGetProperty("packageSignatures", out var signatureItems) &&
+                         signatureItems.ValueKind == JsonValueKind.Object
+            ? signatureItems.EnumerateObject().ToDictionary(
+                x => x.Name,
+                x => x.Value.GetString() ?? string.Empty,
+                StringComparer.Ordinal)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
+        var capabilities = identity.TryGetProperty("capabilities", out var capabilityItems) &&
+                           capabilityItems.ValueKind == JsonValueKind.Array
+            ? capabilityItems.EnumerateArray().Select(x => x.GetString())
+                .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToList()
+            : [];
+        var packageVersions = identity.TryGetProperty("packageVersions", out var versionItems) &&
+                              versionItems.ValueKind == JsonValueKind.Object
+            ? versionItems.EnumerateObject().ToDictionary(
+                x => x.Name,
+                x => x.Value.GetInt64(),
+                StringComparer.Ordinal)
+            : new Dictionary<string, long>(StringComparer.Ordinal);
+        return new(
+            identity.GetProperty("sdk").GetInt32(),
+            identity.GetProperty("device").GetString() ?? string.Empty,
+            identity.GetProperty("buildIncremental").GetString() ?? string.Empty,
+            OptionalString(identity, "crDroidVersion"),
+            OptionalString(identity, "crDroidBuildVersion"),
+            OptionalString(identity, "lineageDevice"),
+            schemas,
+            signatures,
+            capabilities,
+            packageVersions);
+    }
+
+    private static string? OptionalString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static DataRootKind ParseDataRootKind(string? kind) => kind switch
+    {
+        "credential_encrypted" => DataRootKind.CredentialEncrypted,
+        "device_encrypted" => DataRootKind.DeviceEncrypted,
+        "external_data" => DataRootKind.ExternalData,
+        "obb" => DataRootKind.Obb,
+        _ => DataRootKind.Unknown
+    };
 
     public async Task<bool> RequestRestoreApprovalAsync(
         string snapshotId,
@@ -465,12 +561,18 @@ public sealed class AgentClient : IAsyncDisposable
 
     public async Task PreparePackageRestoreAsync(
         string packageName,
+        IReadOnlyCollection<string> roots,
+        bool completeSnapshot,
         CancellationToken cancellationToken = default)
     {
         using var response = await SendCommandAsync(
-            "restore_prepare", new { packageName }, cancellationToken);
+            "restore_prepare", new { packageName, roots, completeSnapshot }, cancellationToken);
         if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
-            throw new InvalidOperationException($"Agent не смог подготовить Restore {packageName}.");
+            throw new InvalidOperationException(
+                $"Agent не смог подготовить Restore {packageName}: " +
+                (response.RootElement.TryGetProperty("error", out var error)
+                    ? error.GetString()
+                    : "unknown_error"));
     }
 
     public async Task FinishPackageRestoreAsync(
@@ -480,7 +582,24 @@ public sealed class AgentClient : IAsyncDisposable
         using var response = await SendCommandAsync(
             "restore_finish", new { packageName }, cancellationToken);
         if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
-            throw new InvalidOperationException($"Agent не смог завершить Restore {packageName}.");
+            throw new PackageRestoreCommitException(
+                $"Agent не смог завершить Restore {packageName}: " +
+                (response.RootElement.TryGetProperty("error", out var error)
+                    ? error.GetString()
+                    : "commit_failed"),
+                response.RootElement.TryGetProperty("rolledBack", out var rolledBack) &&
+                rolledBack.ValueKind == JsonValueKind.True);
+    }
+
+    public async Task AbortPackageRestoreAsync(
+        string packageName,
+        CancellationToken cancellationToken = default)
+    {
+        using var response = await SendCommandAsync(
+            "restore_abort", new { packageName }, cancellationToken);
+        if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+            throw new InvalidOperationException(
+                $"Agent не смог откатить незавершённый Restore {packageName}.");
     }
 
     public async Task<IReadOnlyList<string>> ApplyPackagePolicyAsync(
@@ -494,7 +613,8 @@ public sealed class AgentClient : IAsyncDisposable
                 packageName = metadata.PackageName,
                 enabled = metadata.WasEnabled,
                 batteryOptimizationExempt = metadata.BatteryOptimizationExempt,
-                runtimePermissions = metadata.RuntimePermissions ?? []
+                runtimePermissions = metadata.RuntimePermissions ?? [],
+                appLocales = metadata.AppLocales
             },
             cancellationToken);
         if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
@@ -612,6 +732,20 @@ public sealed class AgentClient : IAsyncDisposable
         return Encoding.UTF8.GetBytes(response.RootElement.GetProperty("state").GetRawText());
     }
 
+    public async Task<string?> GetHomePackageAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var stateJson = await ExportSystemStateAsync(cancellationToken);
+        using var state = JsonDocument.Parse(stateJson);
+        if (!state.RootElement.TryGetProperty("roles", out var roles) ||
+            !roles.TryGetProperty("android.app.role.HOME", out var holders) ||
+            holders.ValueKind != JsonValueKind.Array ||
+            holders.GetArrayLength() == 0)
+            return null;
+        var packageName = holders[0].GetString();
+        return string.IsNullOrWhiteSpace(packageName) ? null : packageName;
+    }
+
     public async Task<byte[]> ExportAccountInventoryAsync(
         CancellationToken cancellationToken = default)
     {
@@ -635,21 +769,43 @@ public sealed class AgentClient : IAsyncDisposable
             permissions.GetProperty("allFiles").GetBoolean());
     }
 
-    public async Task<IReadOnlyList<string>> RestoreSystemStateAsync(
+    public async Task<SystemStateRestoreResult> RestoreSystemStateAsync(
         byte[] stateJson,
+        IReadOnlyCollection<string>? confirmedSettingIds = null,
         CancellationToken cancellationToken = default)
     {
         using var state = JsonDocument.Parse(stateJson);
         using var response = await SendCommandAsync(
             "restore_system_state",
-            new { state = state.RootElement.Clone() },
+            new
+            {
+                state = state.RootElement.Clone(),
+                confirmedSettingIds = confirmedSettingIds ?? []
+            },
             cancellationToken);
         if (!response.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
             throw new InvalidOperationException("Agent не смог применить безопасные настройки Android.");
-        return response.RootElement.GetProperty("failures").EnumerateArray()
+        var failures = response.RootElement.GetProperty("failures").EnumerateArray()
             .Select(x => x.GetString() ?? string.Empty)
             .Where(x => x.Length > 0)
             .ToList();
+        var needsConfirmation = response.RootElement
+            .GetProperty("needsConfirmation").EnumerateArray()
+            .Select(x => x.GetString() ?? string.Empty)
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var outcomes = response.RootElement.GetProperty("outcomes").EnumerateArray()
+            .Select(x => new SettingApplyOutcome(
+                x.GetProperty("id").GetString() ?? string.Empty,
+                x.GetProperty("status").GetString() ?? "unknown",
+                x.GetProperty("reason").GetString() ?? string.Empty,
+                x.TryGetProperty("adapter", out var adapter) && adapter.ValueKind == JsonValueKind.String
+                    ? adapter.GetString()
+                    : null))
+            .Where(x => x.Id.Length > 0)
+            .ToList();
+        return new(failures, needsConfirmation, outcomes);
     }
 
     public async IAsyncEnumerable<FileEntry> ScanSharedAsync(
@@ -722,6 +878,93 @@ public sealed class AgentClient : IAsyncDisposable
         var request = CreateSignedRequest("personal_export", new { kind });
         await WriteFrameAsync(TransferFrameType.Command, request, cancellationToken);
         return new RootReadStream(this);
+    }
+
+    public async Task<Stream> OpenWallpaperAsync(
+        string kind,
+        CancellationToken cancellationToken = default)
+    {
+        if (kind is not ("system" or "lock"))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+        var request = CreateSignedRequest("root_wallpaper_read", new { kind });
+        await WriteFrameAsync(TransferFrameType.Command, request, cancellationToken);
+        return new RootReadStream(this);
+    }
+
+    public async Task<PersonalRestoreResult> RestorePersonalDataAsync(
+        string kind,
+        Func<Stream, CancellationToken, Task> writeContent,
+        CancellationToken cancellationToken = default)
+    {
+        if (kind is not ("contacts" or "messages" or "calls"))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+        var request = CreateSignedRequest("personal_restore", new { kind });
+        await WriteFrameAsync(TransferFrameType.Command, request, cancellationToken);
+        var (readyType, readyPayload) = await ReadFrameAsync(cancellationToken);
+        if (readyType == TransferFrameType.Error)
+            throw new IOException(Encoding.UTF8.GetString(readyPayload));
+        if (readyType != TransferFrameType.Response)
+            throw new InvalidDataException($"Unexpected personal restore response: {readyType}");
+        using (var ready = JsonDocument.Parse(readyPayload))
+        {
+            if (!ready.RootElement.TryGetProperty("ready", out var isReady) || !isReady.GetBoolean())
+                throw new InvalidOperationException("Agent не готов принять personal restore stream.");
+        }
+
+        var output = new ProtocolDataWriteStream(this);
+        Exception? producerError = null;
+        byte[]? response = null;
+        try
+        {
+            await writeContent(output, cancellationToken);
+        }
+        catch (Exception error)
+        {
+            producerError = error;
+        }
+        try
+        {
+            if (producerError is null)
+                response = await output.CompleteResponseAsync(cancellationToken);
+            else
+            {
+                using var abortTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await output.AbortAsync(abortTimeout.Token);
+            }
+        }
+        catch when (producerError is not null) { }
+        if (producerError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(producerError).Throw();
+        using var document = JsonDocument.Parse(response!);
+        var root = document.RootElement;
+        return new(
+            kind,
+            root.TryGetProperty("status", out var status) ? status.GetString() ?? "failed" : "failed",
+            root.TryGetProperty("inserted", out var inserted) ? inserted.GetInt32() : 0,
+            root.TryGetProperty("skipped", out var skipped) ? skipped.GetInt32() : 0,
+            root.TryGetProperty("failed", out var failed) ? failed.GetInt32() : 0,
+            root.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String
+                ? reason.GetString()
+                : root.TryGetProperty("error", out var errorElement)
+                    ? errorElement.GetString()
+                    : null);
+    }
+
+    public Task RestoreWallpaperAsync(
+        string kind,
+        long expectedSize,
+        string? expectedBlake3,
+        Func<Stream, CancellationToken, Task> writeContent,
+        CancellationToken cancellationToken = default)
+    {
+        if (kind is not ("system" or "lock"))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+        return RestoreEntryAsync(
+            "wallpaper_restore",
+            new { kind, expectedSize, expectedBlake3 },
+            "file",
+            writeContent,
+            cancellationToken);
     }
 
     public async Task<Stream> OpenMediaFileAsync(
@@ -812,6 +1055,7 @@ public sealed class AgentClient : IAsyncDisposable
     }
 
     public async Task RestoreRootEntryAsync(
+        string packageName,
         string root,
         FileEntry entry,
         int remappedUid,
@@ -824,6 +1068,7 @@ public sealed class AgentClient : IAsyncDisposable
             throw new InvalidDataException($"Небезопасный путь Restore: {entry.RelativePath}");
         await RestoreEntryAsync("root_restore", new
         {
+            packageName,
             root,
             relative = entry.RelativePath,
             kind = entry.Kind,
@@ -831,6 +1076,8 @@ public sealed class AgentClient : IAsyncDisposable
             uid = remappedUid,
             gid = remappedUid,
             modifiedUnixNanos = entry.ModifiedUnixNanos,
+            expectedSize = entry.Size,
+            expectedBlake3 = entry.ContentHash,
             selinuxLabel = (string?)null
         }, entry.Kind, writeContent, cancellationToken);
     }
@@ -850,7 +1097,9 @@ public sealed class AgentClient : IAsyncDisposable
             root,
             relative = entry.RelativePath,
             kind = entry.Kind,
-            modifiedUnixNanos = entry.ModifiedUnixNanos
+            modifiedUnixNanos = entry.ModifiedUnixNanos,
+            expectedSize = entry.Size,
+            expectedBlake3 = entry.ContentHash
         }, entry.Kind, writeContent, cancellationToken);
     }
 
@@ -891,7 +1140,13 @@ public sealed class AgentClient : IAsyncDisposable
 
         try
         {
-            await output.CompleteAsync(cancellationToken);
+            if (producerError is null)
+                await output.CompleteAsync(cancellationToken);
+            else
+            {
+                using var abortTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await output.AbortAsync(abortTimeout.Token);
+            }
         }
         catch when (producerError is not null)
         {
@@ -1185,18 +1440,22 @@ public sealed class AgentClient : IAsyncDisposable
         ReadOnlyMemory<byte> payload,
         CancellationToken cancellationToken)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(ProtocolIdleTimeout);
         var header = new byte[5];
         header[0] = (byte)type;
         BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(1), payload.Length);
-        await _stream.WriteAsync(header, cancellationToken);
-        await _stream.WriteAsync(payload, cancellationToken);
+        await _stream.WriteAsync(header, timeout.Token);
+        await _stream.WriteAsync(payload, timeout.Token);
     }
 
     private async Task<(TransferFrameType Type, byte[] Payload)> ReadFrameAsync(
         CancellationToken cancellationToken)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(ProtocolIdleTimeout);
         var header = new byte[5];
-        await _stream.ReadExactlyAsync(header, cancellationToken);
+        await _stream.ReadExactlyAsync(header, timeout.Token);
         var type = (TransferFrameType)header[0];
         var length = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1));
         var max = type == TransferFrameType.Data
@@ -1205,7 +1464,7 @@ public sealed class AgentClient : IAsyncDisposable
         if (length < 0 || length > max)
             throw new InvalidDataException($"Agent frame length is invalid: {length}");
         var payload = new byte[length];
-        await _stream.ReadExactlyAsync(payload, cancellationToken);
+        await _stream.ReadExactlyAsync(payload, timeout.Token);
         return (type, payload);
     }
 
@@ -1267,9 +1526,15 @@ public sealed class AgentClient : IAsyncDisposable
                     return 0;
                 }
                 if (type == TransferFrameType.Error)
+                {
+                    _completed = true;
                     throw new IOException(Encoding.UTF8.GetString(payload));
+                }
                 if (type != TransferFrameType.Data)
+                {
+                    _completed = true;
                     throw new InvalidDataException($"Unexpected root read frame: {type}");
+                }
                 _current = payload;
                 _offset = 0;
             }
@@ -1282,6 +1547,38 @@ public sealed class AgentClient : IAsyncDisposable
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_completed)
+                DrainOrPoisonAsync().GetAwaiter().GetResult();
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (!_completed) await DrainOrPoisonAsync();
+            GC.SuppressFinalize(this);
+        }
+
+        private async Task DrainOrPoisonAsync()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                while (!_completed)
+                {
+                    var (type, _) = await owner.ReadFrameAsync(timeout.Token);
+                    if (type is TransferFrameType.End or TransferFrameType.Error)
+                        _completed = true;
+                }
+            }
+            catch
+            {
+                _completed = true;
+                owner._client.Dispose();
+            }
+        }
     }
 
     public sealed class AgentMediaReadStream(AgentClient owner) : Stream
@@ -1396,7 +1693,12 @@ public sealed class AgentClient : IAsyncDisposable
 
         public async Task CompleteAsync(CancellationToken cancellationToken)
         {
-            if (_completed) return;
+            _ = await CompleteResponseAsync(cancellationToken);
+        }
+
+        public async Task<byte[]> CompleteResponseAsync(CancellationToken cancellationToken)
+        {
+            if (_completed) return [];
             _completed = true;
             await owner.WriteFrameAsync(
                 TransferFrameType.End, ReadOnlyMemory<byte>.Empty, cancellationToken);
@@ -1405,12 +1707,31 @@ public sealed class AgentClient : IAsyncDisposable
                 throw new IOException(Encoding.UTF8.GetString(payload));
             if (type != TransferFrameType.End)
                 throw new InvalidDataException($"Unexpected root restore response: {type}");
+            return payload;
+        }
+
+        public async Task AbortAsync(CancellationToken cancellationToken)
+        {
+            if (_completed) return;
+            _completed = true;
+            await owner.WriteFrameAsync(
+                TransferFrameType.Abort, ReadOnlyMemory<byte>.Empty, cancellationToken);
+            var (type, payload) = await owner.ReadFrameAsync(cancellationToken);
+            if (type is not (TransferFrameType.End or TransferFrameType.Error))
+                throw new InvalidDataException($"Unexpected root abort response: {type}");
         }
 
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
+}
+
+internal sealed class PackageRestoreCommitException(
+    string message,
+    bool rolledBack) : InvalidOperationException(message)
+{
+    public bool RolledBack { get; } = rolledBack;
 }
 
 public sealed record SharedStorageCapability(

@@ -1,4 +1,6 @@
 using PhoneBackup.Core;
+using Blake3;
+using System.Security.Cryptography;
 
 namespace PhoneBackup.Desktop;
 
@@ -14,6 +16,7 @@ public sealed class BackupCoordinator(AdbService adb)
         CancellationToken cancellationToken = default,
         string purpose = "manual")
     {
+        await using var repositoryLease = await repository.AcquireOperationLeaseAsync(cancellationToken);
         var snapshots = await repository.ListSnapshotsAsync(cancellationToken);
         var previous = LatestForDevice(snapshots, device);
         var selected = SelectPackages(packages, includeSystemApps);
@@ -38,10 +41,12 @@ public sealed class BackupCoordinator(AdbService adb)
         bool includeFullComponents,
         bool includeCaches,
         bool fullHash,
+        PackageSnapshot? launcherPackage = null,
         IProgress<TransferProgress>? progress = null,
         CancellationToken cancellationToken = default,
         string purpose = "manual")
     {
+        await using var repositoryLease = await repository.AcquireOperationLeaseAsync(cancellationToken);
         var snapshots = await repository.ListSnapshotsAsync(cancellationToken);
         var previous = LatestForDevice(snapshots, device);
         var selected = SelectPackages(packages, includeSystemApps);
@@ -52,8 +57,14 @@ public sealed class BackupCoordinator(AdbService adb)
             : new List<BackupComponentManifest>();
         if (includeAppData)
         {
+            var regularPackages = launcherPackage is null
+                ? selected
+                : selected.Where(x => !string.Equals(
+                    x.PackageName,
+                    launcherPackage.PackageName,
+                    StringComparison.Ordinal)).ToList();
             var appData = await BuildAppDataComponentsAsync(
-                selected,
+                regularPackages,
                 repository,
                 agent,
                 previous,
@@ -61,8 +72,24 @@ public sealed class BackupCoordinator(AdbService adb)
                 fullHash,
                 progress,
                 failures,
-                cancellationToken);
+                cancellationToken,
+                "app-data");
             components.AddRange(appData);
+            if (launcherPackage is not null)
+            {
+                var launcherData = await BuildAppDataComponentsAsync(
+                    [launcherPackage],
+                    repository,
+                    agent,
+                    previous,
+                    includeCaches,
+                    fullHash,
+                    progress,
+                    failures,
+                    cancellationToken,
+                    "launcher-data");
+                components.AddRange(launcherData);
+            }
         }
         var excludedMedia = new ExcludedMediaReport(0, 0, []);
         if (includeSharedStorage)
@@ -81,8 +108,13 @@ public sealed class BackupCoordinator(AdbService adb)
                 repository, agent, progress, cancellationToken));
         }
         if (includeSystemState)
+        {
             components.Add(await BuildSystemStateComponentAsync(
                 repository, agent, progress, cancellationToken));
+            if (includeAppData)
+                components.AddRange(await BuildWallpaperComponentsAsync(
+                    repository, agent, progress, cancellationToken));
+        }
         if (includeFullComponents)
         {
             var full = await BuildFullComponentsAsync(
@@ -132,7 +164,14 @@ public sealed class BackupCoordinator(AdbService adb)
 
                 await using var input = await adb.OpenRemoteFileAsync(
                     serial, artifact.Path, cancellationToken);
-                var chunks = await repository.PutStreamAsync(input, cancellationToken);
+                await using var hashing = new ContentHashingReadStream(input, sha256: true);
+                var chunks = await repository.PutStreamAsync(hashing, cancellationToken);
+                var actualHash = hashing.FinalizeHash();
+                if (hashing.BytesRead != artifact.Size ||
+                    !string.Equals(actualHash, artifact.Sha256,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException(
+                        $"APK changed while backing up: {package.PackageName}/{artifact.FileName}.");
                 files.Add(new(
                     relativePath,
                     "file",
@@ -143,7 +182,7 @@ public sealed class BackupCoordinator(AdbService adb)
                     package.Uid,
                     null,
                     null,
-                    artifact.Sha256,
+                    actualHash,
                     chunks));
             }
             components.Add(Component(package, "apk", package.PackageName, files));
@@ -161,7 +200,8 @@ public sealed class BackupCoordinator(AdbService adb)
         bool fullHash,
         IProgress<TransferProgress>? progress,
         List<BackupFailure> failures,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string componentKind)
     {
         var components = new List<BackupComponentManifest>();
         await using var scanner = await agent.ConnectSiblingAsync(cancellationToken);
@@ -170,16 +210,27 @@ public sealed class BackupCoordinator(AdbService adb)
         foreach (var package in selected)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            progress?.Report(new("app-data", package.Label, packageIndex, selected.Count));
+            progress?.Report(new(componentKind, package.Label, packageIndex, selected.Count));
             await agent.BeginPackageSnapshotAsync(package.PackageName, cancellationToken);
             try
             {
-                for (var rootIndex = 0; rootIndex < package.DataPaths.Count; rootIndex++)
+                var roots = package.DataRoots is { Count: > 0 }
+                    ? package.DataRoots
+                    : package.DataPaths.Select((path, index) => new AppDataRoot(
+                        index == 0 ? DataRootKind.CredentialEncrypted :
+                        index == 1 ? DataRootKind.DeviceEncrypted : DataRootKind.Unknown,
+                        path,
+                        package.UserId)).ToList();
+                for (var rootIndex = 0; rootIndex < roots.Count; rootIndex++)
                 {
-                    var root = package.DataPaths[rootIndex];
-                    var componentId = $"{package.PackageName}:app-data:{rootIndex}";
+                    var dataRoot = roots[rootIndex];
+                    var root = dataRoot.Path;
+                    var componentId = $"{package.PackageName}:{componentKind}:{rootIndex}";
+                    var failureCountBefore = failures.Count;
+                    long scannedFiles = 0;
+                    long scannedBytes = 0;
                     var reusable = previous?.Components
-                        .FirstOrDefault(x => x.Id == componentId && x.Kind == "app-data")
+                        .FirstOrDefault(x => x.Id == componentId && x.Kind == componentKind)
                         ?.Files.ToDictionary(x => x.RelativePath, StringComparer.Ordinal)
                         ?? new Dictionary<string, FileEntry>(StringComparer.Ordinal);
                     var files = new List<FileEntry>();
@@ -188,9 +239,35 @@ public sealed class BackupCoordinator(AdbService adb)
                         await foreach (var entry in scanner.ScanRootAsync(
                                            root, includeCaches, fullHash, cancellationToken))
                         {
+                            if (entry.Kind == "file")
+                            {
+                                scannedFiles++;
+                                scannedBytes += entry.Size;
+                            }
                             if (!RestorePathPolicy.IsSafeRelativePath(entry.RelativePath))
                                 throw new InvalidDataException(
                                     $"Agent returned unsafe path: {entry.RelativePath}");
+                            if (entry.Kind == "symlink" &&
+                                string.Equals(entry.RelativePath, "lib", StringComparison.Ordinal))
+                            {
+                                // PackageManager owns this target-ROM symlink; preserve the target copy.
+                                continue;
+                            }
+                            if (entry.Kind is "special" or "symlink")
+                            {
+                                failures.Add(new(
+                                    componentId,
+                                    package.PackageName,
+                                    entry.RelativePath,
+                                    "root_scan",
+                                    entry.Kind == "symlink"
+                                        ? "unsupported_symlink"
+                                        : "unsupported_special_file",
+                                    entry.Kind == "symlink"
+                                        ? "Symlink was archived in inventory only; automatic restore is disabled."
+                                        : "Transient socket/device/special entry was not archived."));
+                                continue;
+                            }
                             if (reusable.TryGetValue(entry.RelativePath, out var old) &&
                                 CanReuse(old, entry))
                             {
@@ -202,7 +279,7 @@ public sealed class BackupCoordinator(AdbService adb)
                                 files.Add(entry with { Chunks = null });
                                 continue;
                             }
-                            var chunks = await TryPutFileAsync(
+                            var stored = await TryPutFileAsync(
                                 () => reader.OpenRootFileAsync(
                                     root, entry.RelativePath, cancellationToken),
                                 repository,
@@ -216,8 +293,12 @@ public sealed class BackupCoordinator(AdbService adb)
                                     ""),
                                 failures,
                                 cancellationToken);
-                            if (chunks is null) continue;
-                            files.Add(entry with { Chunks = chunks });
+                            if (stored is null) continue;
+                            files.Add(entry with
+                            {
+                                Chunks = stored.Chunks,
+                                ContentHash = stored.ContentHash
+                            });
                         }
                     }
                     catch (Exception error) when (
@@ -231,7 +312,31 @@ public sealed class BackupCoordinator(AdbService adb)
                             error.GetType().FullName ?? error.GetType().Name,
                             error.Message));
                     }
-                    components.Add(Component(package, "app-data", componentId, files));
+                    var componentFailures = failures.Skip(failureCountBefore)
+                        .Select(x => new ComponentFailure(
+                            x.Stage,
+                            string.IsNullOrWhiteSpace(x.RelativePath) ? null : x.RelativePath,
+                            x.ErrorType,
+                            x.Message))
+                        .ToList();
+                    var capturedFiles = files.LongCount(x => x.Kind == "file" && x.Chunks is not null);
+                    var capturedBytes = files.Where(x => x.Kind == "file" && x.Chunks is not null)
+                        .Sum(x => x.Size);
+                    components.Add(Component(
+                        package,
+                        componentKind,
+                        componentId,
+                        files,
+                        componentFailures.Count == 0 && capturedFiles == scannedFiles
+                            ? ComponentStatus.Complete
+                            : ComponentStatus.Partial,
+                        componentKind == "launcher-data"
+                            ? RestoreClass.ExactRom
+                            : RestoreClass.Portable,
+                        dataRoot.Kind,
+                        componentFailures,
+                        new(scannedFiles, capturedFiles, scannedBytes, capturedBytes,
+                            componentFailures.Count == 0)));
                 }
             }
             finally
@@ -286,7 +391,8 @@ public sealed class BackupCoordinator(AdbService adb)
         if (!string.IsNullOrWhiteSpace(current.ContentHash) &&
             !string.Equals(old.ContentHash, current.ContentHash, StringComparison.OrdinalIgnoreCase))
             return false;
-        return current.Kind != "file" || old.Chunks is not null;
+        return current.Kind != "file" ||
+               old.Chunks is not null && !string.IsNullOrWhiteSpace(old.ContentHash);
     }
 
     private static async Task<SharedBuildResult> BuildSharedStorageComponentsAsync(
@@ -314,6 +420,9 @@ public sealed class BackupCoordinator(AdbService adb)
             cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(new("shared-storage", root, index, capability.Roots.Count));
             var componentId = $"shared:{root.Replace('\\', '/').Trim('/')}";
+            var failureCountBefore = failures.Count;
+            long scannedFiles = 0;
+            long scannedBytes = 0;
             var reusable = previous?.Components
                 .FirstOrDefault(x => x.Id == componentId && x.Kind == "shared-storage")
                 ?.Files.ToDictionary(x => x.RelativePath, StringComparer.Ordinal)
@@ -333,6 +442,11 @@ public sealed class BackupCoordinator(AdbService adb)
                         if (samples.Count < 20) samples.Add($"{root}/{entry.RelativePath}");
                         continue;
                     }
+                    if (entry.Kind == "file")
+                    {
+                        scannedFiles++;
+                        scannedBytes += entry.Size;
+                    }
                     if (reusable.TryGetValue(entry.RelativePath, out var old) &&
                         CanReuse(old, entry))
                     {
@@ -344,7 +458,7 @@ public sealed class BackupCoordinator(AdbService adb)
                         files.Add(entry with { Chunks = null });
                         continue;
                     }
-                    var chunks = await TryPutFileAsync(
+                    var stored = await TryPutFileAsync(
                         () => reader.OpenSharedFileAsync(
                             root, entry.RelativePath, cancellationToken),
                         repository,
@@ -358,8 +472,12 @@ public sealed class BackupCoordinator(AdbService adb)
                             ""),
                         failures,
                         cancellationToken);
-                    if (chunks is null) continue;
-                    files.Add(entry with { Chunks = chunks });
+                    if (stored is null) continue;
+                    files.Add(entry with
+                    {
+                        Chunks = stored.Chunks,
+                        ContentHash = stored.ContentHash
+                    });
                 }
             }
             catch (Exception error) when (
@@ -373,12 +491,32 @@ public sealed class BackupCoordinator(AdbService adb)
                     error.GetType().FullName ?? error.GetType().Name,
                     error.Message));
             }
+            var componentFailures = failures.Skip(failureCountBefore)
+                .Select(x => new ComponentFailure(
+                    x.Stage,
+                    string.IsNullOrWhiteSpace(x.RelativePath) ? null : x.RelativePath,
+                    x.ErrorType,
+                    x.Message))
+                .ToList();
+            var capturedFiles = files.LongCount(x => x.Kind == "file" && x.Chunks is not null);
+            var capturedBytes = files.Where(x => x.Kind == "file" && x.Chunks is not null)
+                .Sum(x => x.Size);
             components.Add(new(
                 componentId,
                 "shared-storage",
                 files,
-                files.Where(x => x.Kind == "file").Sum(x => x.Size),
-                files.SelectMany(x => x.Chunks ?? []).Sum(x => (long)x.StoredLength)));
+                capturedBytes,
+                files.SelectMany(x => x.Chunks ?? []).Sum(x => (long)x.StoredLength),
+                Status: componentFailures.Count == 0 && capturedFiles == scannedFiles
+                    ? ComponentStatus.Complete
+                    : ComponentStatus.Partial,
+                RestoreClass: RestoreClass.Portable,
+                SchemaId: "vexark.shared-storage",
+                SchemaVersion: 2,
+                Failures: componentFailures,
+                Verification: new(
+                    scannedFiles, capturedFiles, scannedBytes, capturedBytes,
+                    componentFailures.Count == 0 && capturedFiles == scannedFiles)));
             index++;
         }
         return new(
@@ -405,29 +543,77 @@ public sealed class BackupCoordinator(AdbService adb)
             var item = exports[index];
             progress?.Report(new("personal-data", item.Kind, index, exports.Length));
             if (!item.Granted)
+            {
+                components.Add(new(
+                    $"personal:{item.Kind}",
+                    "personal-data",
+                    [],
+                    0,
+                    0,
+                    Status: ComponentStatus.Skipped,
+                    RestoreClass: item.Kind == "messages"
+                        ? RestoreClass.ArchiveOnly
+                        : RestoreClass.Portable,
+                    SchemaId: $"vexark.personal.{item.Kind}",
+                    SchemaVersion: 2,
+                    Failures:
+                    [
+                        new("permission", null, "permission_not_granted",
+                            $"Android permission for {item.Kind} was not granted.")
+                    ],
+                    Verification: new(0, 0, 0, 0, false)));
                 continue;
-            await using var input = await agent.OpenPersonalDataAsync(item.Kind, cancellationToken);
-            var chunks = await repository.PutStreamAsync(input, cancellationToken);
-            var plainBytes = chunks.Sum(x => (long)x.PlainLength);
-            components.Add(new(
-                $"personal:{item.Kind}",
-                "personal-data",
-                [
-                    new(
-                        item.FileName,
-                        "file",
-                        plainBytes,
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
-                        0,
-                        0,
-                        0,
-                        null,
-                        null,
-                        null,
-                        chunks)
-                ],
-                plainBytes,
-                chunks.Sum(x => (long)x.StoredLength)));
+            }
+            try
+            {
+                await using var input = await agent.OpenPersonalDataAsync(item.Kind, cancellationToken);
+                var chunks = await repository.PutStreamAsync(input, cancellationToken);
+                var plainBytes = chunks.Sum(x => (long)x.PlainLength);
+                var file = new FileEntry(
+                    item.FileName,
+                    "file",
+                    plainBytes,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
+                    0,
+                    0,
+                    0,
+                    null,
+                    null,
+                    null,
+                    chunks);
+                components.Add(new(
+                    $"personal:{item.Kind}",
+                    "personal-data",
+                    [file],
+                    plainBytes,
+                    chunks.Sum(x => (long)x.StoredLength),
+                    Status: ComponentStatus.Complete,
+                    RestoreClass: item.Kind == "messages"
+                        ? RestoreClass.ArchiveOnly
+                        : RestoreClass.Portable,
+                    SchemaId: $"vexark.personal.{item.Kind}",
+                    SchemaVersion: 2,
+                    Verification: new(1, 1, plainBytes, plainBytes, true)));
+            }
+            catch (Exception error) when (
+                error is not OperationCanceledException &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                components.Add(new(
+                    $"personal:{item.Kind}",
+                    "personal-data",
+                    [],
+                    0,
+                    0,
+                    Status: ComponentStatus.Failed,
+                    RestoreClass: item.Kind == "messages"
+                        ? RestoreClass.ArchiveOnly
+                        : RestoreClass.Portable,
+                    SchemaId: $"vexark.personal.{item.Kind}",
+                    SchemaVersion: 2,
+                    Failures: [new("personal_export", null, "export_failed", error.Message)],
+                    Verification: new(1, 0, 0, 0, false)));
+            }
         }
 
         var permissionReport = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
@@ -485,6 +671,67 @@ public sealed class BackupCoordinator(AdbService adb)
             chunks.Sum(x => (long)x.StoredLength));
     }
 
+    private static async Task<IReadOnlyList<BackupComponentManifest>> BuildWallpaperComponentsAsync(
+        EncryptedRepository repository,
+        AgentClient agent,
+        IProgress<TransferProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        var components = new List<BackupComponentManifest>();
+        var kinds = new[] { "system", "lock" };
+        for (var index = 0; index < kinds.Length; index++)
+        {
+            var kind = kinds[index];
+            progress?.Report(new("wallpaper", kind, index, kinds.Length));
+            try
+            {
+                await using var source = await agent.OpenWallpaperAsync(kind, cancellationToken);
+                await using var hashing = new ContentHashingReadStream(source, sha256: false);
+                var chunks = await repository.PutStreamAsync(hashing, cancellationToken);
+                if (hashing.BytesRead == 0) continue;
+                var hash = hashing.FinalizeHash();
+                var file = new FileEntry(
+                    $"{kind}.wallpaper",
+                    "file",
+                    hashing.BytesRead,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
+                    0, 0, 0, null, null, hash, chunks);
+                components.Add(new(
+                    $"wallpaper:{kind}",
+                    "wallpaper",
+                    [file],
+                    file.Size,
+                    chunks.Sum(x => (long)x.StoredLength)));
+            }
+            catch (Exception error) when (
+                error is IOException or InvalidOperationException &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                var optionalLock = kind == "lock";
+                components.Add(new(
+                    $"wallpaper:{kind}",
+                    "wallpaper",
+                    [],
+                    0,
+                    0,
+                    Status: optionalLock ? ComponentStatus.Skipped : ComponentStatus.Failed,
+                    RestoreClass: RestoreClass.Portable,
+                    SchemaId: "vexark.wallpaper",
+                    SchemaVersion: 2,
+                    Failures:
+                    [
+                        new(
+                            "wallpaper_read",
+                            null,
+                            optionalLock ? "not_independently_available" : "read_failed",
+                            error.Message)
+                    ],
+                    Verification: new(0, 0, 0, 0, optionalLock)));
+            }
+        }
+        return components;
+    }
+
     private static async Task<BackupComponentManifest> BuildAccountInventoryComponentAsync(
         EncryptedRepository repository,
         AgentClient agent,
@@ -533,6 +780,9 @@ public sealed class BackupCoordinator(AdbService adb)
         for (var index = 0; index < roots.Length; index++)
         {
             var source = roots[index];
+            var failureCountBefore = failures.Count;
+            long scannedFiles = 0;
+            long scannedBytes = 0;
             progress?.Report(new("full", source.Id, index, roots.Length));
             var reusable = previous?.Components
                 .FirstOrDefault(x => x.Id == source.Id && x.Kind == "full")
@@ -547,6 +797,11 @@ public sealed class BackupCoordinator(AdbService adb)
                                    fullHash: true,
                                    cancellationToken))
                 {
+                    if (entry.Kind == "file")
+                    {
+                        scannedFiles++;
+                        scannedBytes += entry.Size;
+                    }
                     if (!RestorePathPolicy.IsSafeRelativePath(entry.RelativePath))
                         throw new InvalidDataException(
                             $"Agent returned unsafe Full path: {entry.RelativePath}");
@@ -561,7 +816,7 @@ public sealed class BackupCoordinator(AdbService adb)
                         files.Add(entry with { Chunks = null });
                         continue;
                     }
-                    var chunks = await TryPutFileAsync(
+                    var stored = await TryPutFileAsync(
                         () => reader.OpenRootFileAsync(
                             source.Root, entry.RelativePath, cancellationToken),
                         repository,
@@ -575,8 +830,12 @@ public sealed class BackupCoordinator(AdbService adb)
                             ""),
                         failures,
                         cancellationToken);
-                    if (chunks is null) continue;
-                    files.Add(entry with { Chunks = chunks });
+                    if (stored is null) continue;
+                    files.Add(entry with
+                    {
+                        Chunks = stored.Chunks,
+                        ContentHash = stored.ContentHash
+                    });
                 }
             }
             catch (Exception error) when (
@@ -590,17 +849,37 @@ public sealed class BackupCoordinator(AdbService adb)
                     error.GetType().FullName ?? error.GetType().Name,
                     error.Message));
             }
+            var componentFailures = failures.Skip(failureCountBefore)
+                .Select(x => new ComponentFailure(
+                    x.Stage,
+                    string.IsNullOrWhiteSpace(x.RelativePath) ? null : x.RelativePath,
+                    x.ErrorType,
+                    x.Message))
+                .ToList();
+            var capturedFiles = files.LongCount(x => x.Kind == "file" && x.Chunks is not null);
+            var capturedBytes = files.Where(x => x.Kind == "file" && x.Chunks is not null)
+                .Sum(x => x.Size);
             components.Add(new(
                 source.Id,
                 "full",
                 files,
-                files.Where(x => x.Kind == "file").Sum(x => x.Size),
-                files.SelectMany(x => x.Chunks ?? []).Sum(x => (long)x.StoredLength)));
+                capturedBytes,
+                files.SelectMany(x => x.Chunks ?? []).Sum(x => (long)x.StoredLength),
+                Status: componentFailures.Count == 0 && capturedFiles == scannedFiles
+                    ? ComponentStatus.Complete
+                    : ComponentStatus.Partial,
+                RestoreClass: RestoreClass.ArchiveOnly,
+                SchemaId: $"vexark.{source.Id}",
+                SchemaVersion: 2,
+                Failures: componentFailures,
+                Verification: new(
+                    scannedFiles, capturedFiles, scannedBytes, capturedBytes,
+                    componentFailures.Count == 0 && capturedFiles == scannedFiles)));
         }
         return components;
     }
 
-    private static async Task<IReadOnlyList<ChunkReference>?> TryPutFileAsync(
+    private static async Task<StoredFile?> TryPutFileAsync(
         Func<Task<Stream>> open,
         EncryptedRepository repository,
         FileEntry entry,
@@ -614,12 +893,19 @@ public sealed class BackupCoordinator(AdbService adb)
             try
             {
                 await using var input = await open();
-                var chunks = await repository.PutStreamAsync(input, cancellationToken);
-                var copiedBytes = chunks.Sum(x => (long)x.PlainLength);
+                await using var hashing = new ContentHashingReadStream(input, sha256: false);
+                var chunks = await repository.PutStreamAsync(hashing, cancellationToken);
+                var copiedBytes = hashing.BytesRead;
                 if (copiedBytes != entry.Size)
                     throw new IOException(
                         $"File changed during backup: scanned={entry.Size}, read={copiedBytes}.");
-                return chunks;
+                var actualHash = hashing.FinalizeHash();
+                if (!string.IsNullOrWhiteSpace(entry.ContentHash) &&
+                    !string.Equals(actualHash, entry.ContentHash,
+                            StringComparison.OrdinalIgnoreCase))
+                    throw new IOException(
+                        $"File content changed during backup: {entry.RelativePath}.");
+                return new(chunks, actualHash);
             }
             catch (IOException error) when (!cancellationToken.IsCancellationRequested)
             {
@@ -636,6 +922,10 @@ public sealed class BackupCoordinator(AdbService adb)
         });
         return null;
     }
+
+    private sealed record StoredFile(
+        IReadOnlyList<ChunkReference> Chunks,
+        string ContentHash);
 
     private static bool IsRecoverableScanFailure(
         Exception error,
@@ -678,19 +968,29 @@ public sealed class BackupCoordinator(AdbService adb)
                     chunks)
             ],
             report.LongLength,
-            chunks.Sum(x => (long)x.StoredLength));
+            chunks.Sum(x => (long)x.StoredLength),
+            Status: ComponentStatus.Complete,
+            RestoreClass: RestoreClass.ArchiveOnly,
+            SchemaId: "vexark.backup-failures",
+            SchemaVersion: 2,
+            Verification: new(1, 1, report.LongLength, report.LongLength, true));
     }
 
     private static BackupComponentManifest Component(
         PackageSnapshot package,
         string kind,
         string id,
-        IReadOnlyList<FileEntry> files) =>
+        IReadOnlyList<FileEntry> files,
+        ComponentStatus status = ComponentStatus.Complete,
+        RestoreClass restoreClass = RestoreClass.Portable,
+        DataRootKind dataRootKind = DataRootKind.Unknown,
+        IReadOnlyList<ComponentFailure>? failures = null,
+        ComponentVerification? verification = null) =>
         new(
             id,
             kind,
             files,
-            files.Where(x => x.Kind == "file").Sum(x => x.Size),
+            files.Where(x => x.Kind == "file" && x.Chunks is not null).Sum(x => x.Size),
             files.SelectMany(x => x.Chunks ?? []).Sum(x => (long)x.StoredLength),
             new(
                 package.PackageName,
@@ -699,7 +999,23 @@ public sealed class BackupCoordinator(AdbService adb)
                 package.SigningCertificateSha256,
                 package.IsEnabled,
                 package.RuntimePermissions,
-                package.BatteryOptimizationExempt));
+                package.BatteryOptimizationExempt,
+                package.SigningLineageSha256,
+                package.TargetSdk,
+                package.AppLocales),
+            status,
+            restoreClass,
+            $"vexark.{kind}",
+            2,
+            package.UserId,
+            dataRootKind,
+            failures,
+            verification ?? new(
+                files.LongCount(x => x.Kind == "file"),
+                files.LongCount(x => x.Kind == "file" && x.Chunks is not null),
+                files.Where(x => x.Kind == "file").Sum(x => x.Size),
+                files.Where(x => x.Kind == "file" && x.Chunks is not null).Sum(x => x.Size),
+                status == ComponentStatus.Complete));
 
     private static async Task<SnapshotManifest> CommitAsync(
         DeviceInventory device,
@@ -712,18 +1028,153 @@ public sealed class BackupCoordinator(AdbService adb)
         ExcludedMediaReport? excludedMedia = null,
         BackupMode mode = BackupMode.Portable)
     {
+        var normalized = components.Select(NormalizeComponent).ToList();
+        var complete = normalized.Count(x => x.Status == ComponentStatus.Complete);
+        var partial = normalized.Count(x => x.Status is ComponentStatus.Partial or ComponentStatus.Unknown);
+        var failed = normalized.Count(x => x.Status == ComponentStatus.Failed);
+        var skipped = normalized.Count(x => x.Status == ComponentStatus.Skipped);
+        var meaningfulSkipped = normalized.Count(x =>
+            x.Status == ComponentStatus.Skipped &&
+            x.Failures?.All(failure =>
+                failure.ErrorCode == "not_independently_available") != true);
+        var overall = failed > 0 && complete == 0
+            ? ComponentStatus.Failed
+            : partial > 0 || failed > 0 || meaningfulSkipped > 0
+                ? ComponentStatus.Partial
+                : ComponentStatus.Complete;
+        var warnings = normalized.Where(x => x.Status != ComponentStatus.Complete)
+            .Select(x => $"{x.Id}: {x.Status}")
+            .Take(98)
+            .ToList();
+        warnings.Add(
+            "Android Keystore/StrongBox, hardware-bound secrets, OAuth sessions, PIN/biometrics, Wallet, DRM and eSIM credentials are not portable; affected apps may require sign-in or secret re-entry after restore.");
+        if (normalized.Any(x => x.Kind == "app-data"))
+            warnings.Add(
+                "Private app files are captured, but keys encrypted by Android Keystore cannot be restored; app-data success does not guarantee that encrypted accounts or tunnels remain usable.");
+        var summary = new SnapshotSummary(
+            overall,
+            complete,
+            partial,
+            failed,
+            skipped,
+            warnings.Take(100).ToList());
         var manifest = new SnapshotManifest(
-            1,
+            2,
             Guid.NewGuid().ToString("N"),
             DateTimeOffset.UtcNow,
             mode,
             device,
-            components,
+            normalized,
             excludedMedia ?? new(0, 0, []),
-            purpose);
+            purpose,
+            device.Rom,
+            summary);
         await repository.CommitSnapshotAsync(manifest, cancellationToken);
         progress?.Report(new("complete", manifest.SnapshotId, packageCount, packageCount));
         return manifest;
+    }
+
+    private static BackupComponentManifest NormalizeComponent(BackupComponentManifest component)
+    {
+        if (component.Status != ComponentStatus.Unknown) return component;
+        var expectedFiles = component.Files.LongCount(x => x.Kind == "file");
+        var capturedFiles = component.Files.LongCount(x => x.Kind == "file" && x.Chunks is not null);
+        var complete = expectedFiles == capturedFiles && component.Files.All(x =>
+            x.Kind is not ("special" or "symlink") &&
+            (x.Kind != "file" || x.Chunks is not null));
+        var restoreClass = component.Kind switch
+        {
+            "apk" or "app-data" or "shared-storage" or "personal-data" or "system-state" =>
+                RestoreClass.Portable,
+            "wallpaper" => RestoreClass.Portable,
+            "launcher-data" => RestoreClass.ExactRom,
+            _ => RestoreClass.ArchiveOnly
+        };
+        return component with
+        {
+            Status = complete ? ComponentStatus.Complete : ComponentStatus.Partial,
+            RestoreClass = restoreClass,
+            SchemaId = component.SchemaId ?? $"vexark.{component.Kind}",
+            SchemaVersion = 2,
+            Verification = component.Verification ?? new(
+                expectedFiles,
+                capturedFiles,
+                component.Files.Where(x => x.Kind == "file").Sum(x => x.Size),
+                component.Files.Where(x => x.Kind == "file" && x.Chunks is not null).Sum(x => x.Size),
+                complete)
+        };
+    }
+
+    private sealed class ContentHashingReadStream(Stream inner, bool sha256) : Stream
+    {
+        private readonly IncrementalHash? _sha256 = sha256
+            ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+            : null;
+        private readonly Hasher? _blake3 = sha256 ? null : Hasher.New();
+        private bool _finalized;
+        public long BytesRead { get; private set; }
+
+        public string FinalizeHash()
+        {
+            if (_finalized) throw new InvalidOperationException("Hash already finalized.");
+            _finalized = true;
+            return _sha256 is not null
+                ? Convert.ToHexString(_sha256.GetHashAndReset()).ToLowerInvariant()
+                : _blake3!.Finalize().ToString();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = inner.Read(buffer, offset, count);
+            Append(buffer.AsSpan(offset, read));
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            Append(buffer.Span[..read]);
+            return read;
+        }
+
+        private void Append(ReadOnlySpan<byte> value)
+        {
+            if (value.IsEmpty) return;
+            BytesRead += value.Length;
+            _sha256?.AppendData(value);
+            _blake3?.Update(value);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _sha256?.Dispose();
+                _blake3?.Dispose();
+                inner.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            _sha256?.Dispose();
+            _blake3?.Dispose();
+            await inner.DisposeAsync().ConfigureAwait(false);
+            GC.SuppressFinalize(this);
+        }
+
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => BytesRead; set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private static SnapshotManifest? LatestForDevice(

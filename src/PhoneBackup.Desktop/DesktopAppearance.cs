@@ -266,6 +266,8 @@ public static class LocalizationManager
             "Choose the data to include in the encrypted backup.",
         ["Приложения и split APK"] = "Apps and split APKs",
         ["Приватные данные приложений — нужен root"] = "Private app data — root required",
+        ["Приватные данные приложений и рабочего стола — нужен root"] = "Private app data and home screen — root required",
+        ["Включает раскладку активного Launcher и порядок плиток быстрых настроек."] = "Includes the active Launcher layout and Quick Settings tile order.",
         ["Документы, загрузки, музыка и аудио"] = "Documents, downloads, music and audio",
         ["Контакты, SMS, звонки и список аккаунтов"] = "Contacts, SMS, calls and account inventory",
         ["Full snapshot — только для той же ROM"] = "Full snapshot — same ROM only",
@@ -357,6 +359,7 @@ public static class LocalizationManager
         ["Перед восстановлением VeXArk проверит ROM, подписи приложений и опасные компоненты."] =
             "Before restoring, VeXArk checks the ROM, app signatures and risky components.",
         ["Загрузить список копий"] = "Load backups",
+        ["Сравнить с телефоном"] = "Compare with phone",
         ["Проверка совместимости"] = "Compatibility check",
         ["Разрешить downgrade APK после предупреждения"] = "Allow APK downgrade after warning",
         ["Проверить и восстановить"] = "Verify and restore",

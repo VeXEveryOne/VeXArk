@@ -8,7 +8,7 @@ import java.io.InputStream
 import java.io.OutputStream
 
 enum class FrameType(val wireValue: Int) {
-    COMMAND(1), RESPONSE(2), FILE_META(3), DATA(4), PROGRESS(5), END(6), ERROR(7);
+    COMMAND(1), RESPONSE(2), FILE_META(3), DATA(4), PROGRESS(5), END(6), ERROR(7), ABORT(8);
 
     companion object {
         fun from(value: Int): FrameType =

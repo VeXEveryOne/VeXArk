@@ -190,88 +190,6 @@ public sealed partial class AdbService
             throw new InvalidOperationException(result);
     }
 
-    public async Task<int> CreateInstallSessionAsync(
-        string serial,
-        long totalBytes,
-        bool allowDowngrade,
-        CancellationToken cancellationToken = default)
-    {
-        if (totalBytes <= 0) throw new ArgumentOutOfRangeException(nameof(totalBytes));
-        var arguments = new List<string>
-        {
-            "-s", serial, "shell", "pm", "install-create", "-r", "-S", totalBytes.ToString()
-        };
-        if (allowDowngrade) arguments.Add("-d");
-        var result = await RunAsync(arguments, cancellationToken);
-        var match = InstallSessionRegex().Match(result);
-        if (!match.Success || !int.TryParse(match.Groups["id"].Value, out var sessionId))
-            throw new InvalidOperationException($"PackageInstaller не создал session: {result.Trim()}");
-        return sessionId;
-    }
-
-    public async Task WriteInstallSessionAsync(
-        string serial,
-        int sessionId,
-        string splitName,
-        long size,
-        Func<Stream, CancellationToken, Task> producer,
-        CancellationToken cancellationToken = default)
-    {
-        if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
-        if (!SafeSplitNameRegex().IsMatch(splitName))
-            throw new ArgumentException("Некорректное имя APK split.", nameof(splitName));
-        var start = CreateStartInfo([
-            "-s", serial, "shell", "pm", "install-write",
-            "-S", size.ToString(), sessionId.ToString(), splitName, "-"
-        ]);
-        start.RedirectStandardInput = true;
-        using var process = Process.Start(start)
-            ?? throw new InvalidOperationException("Не удалось запустить ADB PackageInstaller.");
-        var stdout = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderr = process.StandardError.ReadToEndAsync(cancellationToken);
-        Exception? producerError = null;
-        try
-        {
-            await producer(process.StandardInput.BaseStream, cancellationToken);
-        }
-        catch (Exception error)
-        {
-            producerError = error;
-        }
-        await process.StandardInput.BaseStream.DisposeAsync();
-        await process.WaitForExitAsync(cancellationToken);
-        var result = (await stdout) + (await stderr);
-        if (producerError is not null &&
-            !result.Contains("Success", StringComparison.OrdinalIgnoreCase))
-            throw new IOException(
-                $"PackageInstaller closed the input stream: {result.Trim()}",
-                producerError);
-        if (process.ExitCode != 0 ||
-            !result.Contains("Success", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"PackageInstaller write failed: {result.Trim()}");
-    }
-
-    public async Task CommitInstallSessionAsync(
-        string serial,
-        int sessionId,
-        CancellationToken cancellationToken = default)
-    {
-        var result = await RunAsync(
-            ["-s", serial, "shell", "pm", "install-commit", sessionId.ToString()],
-            cancellationToken);
-        if (!result.Contains("Success", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"PackageInstaller commit failed: {result.Trim()}");
-    }
-
-    public async Task AbandonInstallSessionAsync(
-        string serial,
-        int sessionId,
-        CancellationToken cancellationToken = default) =>
-        _ = await RunAsync(
-            ["-s", serial, "shell", "pm", "install-abandon", sessionId.ToString()],
-            cancellationToken,
-            throwOnError: false);
-
     public Task<Stream> OpenRemoteFileAsync(
         string serial,
         string remotePath,
@@ -428,12 +346,6 @@ public sealed partial class AdbService
 
     [GeneratedRegex(@"(?m)^\S+\s+(?<total>\d+)\s+\d+\s+(?<available>\d+)\s+\d+%\s+\S+\s*$")]
     private static partial Regex DiskRegex();
-
-    [GeneratedRegex(@"\[(?<id>\d+)\]")]
-    private static partial Regex InstallSessionRegex();
-
-    [GeneratedRegex(@"^[A-Za-z0-9._-]+$")]
-    private static partial Regex SafeSplitNameRegex();
 
     private sealed class AdbProcessReadStream(
         Process process,

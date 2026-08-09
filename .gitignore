@@ -5,6 +5,8 @@
 **/obj/
 **/build/
 **/target/
+**/__pycache__/
+*.py[cod]
 .gradle/
 local.properties
 *.user

@@ -103,11 +103,16 @@ required.
 Designed for moving between ROMs:
 
 - base and split APKs;
-- rooted CE/DE app data and external app data;
-- runtime permissions, app-ops and selected package state;
-- contacts, SMS/MMS metadata, call log and account inventory;
+- rooted CE/DE app data, `/Android/data`, OBB and optional caches, with an
+  explicit `Complete`/`Partial` result for every data root;
+- dangerous runtime-permission grants, enabled state, battery exemption and
+  per-app locales (protected permission flags and arbitrary app-ops are not replayed);
+- contacts and call log with merge/deduplication; SMS/MMS is retained as an
+  encrypted archive until temporary default-SMS-role restore is implemented;
 - Documents, Downloads, Music, Podcasts, Recordings and other non-visual media;
-- safe Android settings and roles.
+- a typed AOSP/Lineage/crDroid settings catalog, coverage for unknown provider
+  keys, confirmed roles, system language, compatible theme overlays and rooted
+  home/lock wallpapers.
 
 Photos and videos are excluded from encrypted snapshots by default and are
 handled by the simpler no-root media exporter.
@@ -117,9 +122,10 @@ not read iOS app data, messages, credentials or device backups.
 
 ### Controlled Full
 
-Adds ROM-sensitive data such as selected Wi-Fi internals, launcher/SystemUI state
-and root-module metadata. Full components are classified as `EXACT`,
-`SAME_FAMILY` or `PORTABLE_ONLY` and are never restored blindly.
+Adds encrypted archive-only snapshots of selected Wi-Fi internals and KernelSU/
+Magisk module files. Compatible Launcher3 data is handled separately as
+`ExactRom` and restored only after ROM identity, package signature and safety
+snapshot checks. Archive-only components are never applied automatically.
 
 ## What VeXArk will never copy
 
@@ -183,13 +189,16 @@ Outputs:
 
 ## Project status
 
-The no-root pipeline and encrypted repository are implemented and covered by
-automated tests. Root-only private app-data and Controlled Full restore paths are
-capability-gated and still require broader device/ROM validation before a stable
-1.0 release.
+The no-root pipeline, encrypted manifest v2 repository, typed ROM coverage and
+transactional rooted app-data restore are implemented and covered by automated
+tests. Settings without a stable public/provider API (including most
+XiaomiParts, GameSpace, LiveDisplay and charging-control internals) are reported
+as archive-only instead of being written blindly. Broad device/ROM round-trip
+validation is still required before a stable 1.0 release.
 
-See the complete [changelog](CHANGELOG.md), [threat model](docs/THREAT_MODEL.md)
-[Fast Media protocol](docs/FAST_MEDIA_PROTOCOL.md) and
+See the complete [changelog](CHANGELOG.md), [threat model](docs/THREAT_MODEL.md),
+[Fast Media protocol](docs/FAST_MEDIA_PROTOCOL.md),
+[ROM source catalog](docs/ROM_SOURCE_CATALOG.md) and
 [contribution guide](CONTRIBUTING.md).
 
 ## License and acknowledgements

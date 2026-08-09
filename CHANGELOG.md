@@ -8,7 +8,45 @@ and the project uses semantic versioning.
 
 ## [Unreleased]
 
-- Additional restore fixtures across Android 10–16 and multiple ROM families.
+### Added
+
+- Manifest v2 component completeness, typed CE/DE/external/OBB roots, ROM
+  identity, restore classes, coverage and per-component verification/failures.
+- Typed AOSP, Lineage, crDroid 12, Launcher3, Xiaomi dada, GameSpace and theme
+  adapter catalogs. Unknown active provider keys are explicitly archived or
+  ignored with a reason.
+- Transactional rooted app-data restore with persistent recovery journal,
+  size/BLAKE3 verification, read-back health check and rollback.
+- Virtualized per-item operation UI with Pending/Running/NeedsUser/Succeeded/
+  Skipped/Failed/RolledBack states, central repository unlock and detailed report.
+- Rooted home/lock wallpaper backup with restore through `WallpaperManager`,
+  contacts/call-log merge with deduplication, system locale and conservative
+  same-ROM theme overlay restore.
+- Reproducible, discovery-only ROM source scanner plus a Xiaomi 13 (`fuxi`)
+  seed catalog covering the open-source families listed in the linked 4PDA topic.
+
+### Changed
+
+- APK inventory no longer hashes every installed artifact during compatibility
+  checks; hashes are fetched only for selected packages.
+- Play Protect remains enabled and delayed installs are shown as `NeedsUser`.
+- Exact-ROM compatibility ignores spoofable fingerprint but requires SDK,
+  codename, incremental build, provider schemas, component signatures and versions.
+- SMS/MMS, unsupported ROM services, raw Wi-Fi/root-module payloads and unknown
+  preferences are reported honestly as archive-only.
+- APK preflight now authenticates chunks, object ids, size and whole-file SHA-256
+  in one pass. Restore stages the next verified APK while Android installs the
+  current package, but keeps PackageManager commits strictly sequential.
+
+### Fixed
+
+- Removed verifier-disabling and obsolete install-session paths.
+- A failed shared/full scan can no longer be published as a complete component.
+- Root stream abort/drain handling, FIFO cleanup races, global helper locking,
+  corrupted manifests, repository concurrency and password-without-input UI.
+
+- Additional restore fixtures across Android 10–16 and multiple ROM families
+  remain planned before 1.0.
 
 ## [0.8.0-beta.4] — 2026-07-30
 

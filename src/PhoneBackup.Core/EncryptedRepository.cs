@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Blake3;
 using Konscious.Security.Cryptography;
 using ZstdSharp;
@@ -25,10 +26,16 @@ public sealed class EncryptedRepository
     private const int ArgonIterations = 3;
     private const int ArgonMemoryKiB = 64 * 1024;
     private static readonly int ArgonParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+    private static readonly JsonSerializerOptions RepositoryJson =
+        new(JsonSerializerDefaults.Web);
     private readonly string _root;
     private readonly byte[] _encryptionKey;
     private readonly byte[] _dedupKey;
     private readonly FastCdcChunker _chunker = new();
+    private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private readonly ConcurrentQueue<string> _snapshotErrors = new();
+
+    public IReadOnlyList<string> SnapshotErrors => _snapshotErrors.ToArray();
 
     private EncryptedRepository(string root, RepositoryUnlock unlock)
     {
@@ -87,7 +94,7 @@ public sealed class EncryptedRepository
 
         await WriteAtomicAsync(
             Path.Combine(root, "repository.json"),
-            JsonSerializer.SerializeToUtf8Bytes(header),
+            JsonSerializer.SerializeToUtf8Bytes(header, RepositoryJson),
             cancellationToken);
 
         var unlock = new RepositoryUnlock(masterKey, repositoryId);
@@ -136,6 +143,38 @@ public sealed class EncryptedRepository
         return references;
     }
 
+    public async ValueTask<IAsyncDisposable> AcquireOperationLeaseAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            Directory.CreateDirectory(_root);
+            var lockPath = Path.Combine(_root, ".vexark.lock");
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(30);
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var stream = new FileStream(
+                        lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None,
+                        1, FileOptions.DeleteOnClose);
+                    return new RepositoryLease(this, stream);
+                }
+                catch (IOException) when (DateTimeOffset.UtcNow < deadline)
+                {
+                    await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+        catch
+        {
+            _operationGate.Release();
+            throw;
+        }
+    }
+
     public async Task RestoreStreamAsync(
         IEnumerable<ChunkReference> references,
         Stream output,
@@ -143,10 +182,10 @@ public sealed class EncryptedRepository
     {
         foreach (var reference in references)
         {
-            var plain = await ReadChunkAsync(reference, cancellationToken);
+            var plain = await ReadChunkAsync(reference, cancellationToken).ConfigureAwait(false);
             if (plain.Length != reference.PlainLength)
                 throw new InvalidDataException($"Object {reference.ObjectId} has an invalid plain length.");
-            await output.WriteAsync(plain, cancellationToken);
+            await output.WriteAsync(plain, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -159,7 +198,7 @@ public sealed class EncryptedRepository
                      .Select(x => x.First()))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var plain = await ReadChunkAsync(reference, cancellationToken);
+            var plain = await ReadChunkAsync(reference, cancellationToken).ConfigureAwait(false);
             if (plain.Length != reference.PlainLength)
                 throw new InvalidDataException(
                     $"Object {reference.ObjectId} has an invalid plain length.");
@@ -171,11 +210,60 @@ public sealed class EncryptedRepository
         }
     }
 
+    public async Task VerifyFileAsync(
+        IEnumerable<ChunkReference> references,
+        long expectedSize,
+        string expectedSha256,
+        CancellationToken cancellationToken = default)
+    {
+        if (expectedSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedSize));
+        byte[] expectedHash;
+        try
+        {
+            expectedHash = Convert.FromHexString(expectedSha256);
+        }
+        catch (FormatException error)
+        {
+            throw new InvalidDataException("Expected file SHA-256 is invalid.", error);
+        }
+        if (expectedHash.Length != 32)
+            throw new InvalidDataException("Expected file SHA-256 must be 32 bytes.");
+
+        using var fileHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long actualSize = 0;
+        foreach (var reference in references)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var plain = await ReadChunkAsync(reference, cancellationToken).ConfigureAwait(false);
+            if (plain.Length != reference.PlainLength)
+                throw new InvalidDataException(
+                    $"Object {reference.ObjectId} has an invalid plain length.");
+
+            var digest = Hasher.Hash(plain).AsSpan().ToArray();
+            var expectedObjectId = Convert.ToHexString(KeyedHash(_dedupKey, digest)).ToLowerInvariant();
+            if (!string.Equals(expectedObjectId, reference.ObjectId, StringComparison.Ordinal))
+                throw new InvalidDataException(
+                    $"Object {reference.ObjectId} has an invalid content hash.");
+
+            fileHash.AppendData(plain);
+            actualSize = checked(actualSize + plain.Length);
+        }
+
+        var actualHash = fileHash.GetHashAndReset();
+        if (actualSize != expectedSize)
+            throw new InvalidDataException(
+                $"File size mismatch. Expected {expectedSize}, got {actualSize}.");
+        if (!CryptographicOperations.FixedTimeEquals(actualHash, expectedHash))
+            throw new InvalidDataException("File SHA-256 does not match the manifest.");
+    }
+
     public async Task CommitSnapshotAsync(
         SnapshotManifest manifest,
         CancellationToken cancellationToken = default)
     {
-        var plain = JsonSerializer.SerializeToUtf8Bytes(manifest);
+        ValidateManifest(manifest);
+        var plain = JsonSerializer.SerializeToUtf8Bytes(manifest, RepositoryJson);
         var idBytes = KeyedHash(_dedupKey, Encoding.UTF8.GetBytes(manifest.SnapshotId));
         var opaqueId = Convert.ToHexString(idBytes).ToLowerInvariant();
         var encrypted = Encrypt(plain, _encryptionKey, Encoding.UTF8.GetBytes(opaqueId));
@@ -189,34 +277,45 @@ public sealed class EncryptedRepository
         CancellationToken cancellationToken = default)
     {
         var manifests = new List<SnapshotManifest>();
+        while (_snapshotErrors.TryDequeue(out _)) { }
         var directory = Path.Combine(_root, "snapshots");
         if (!Directory.Exists(directory)) return manifests;
         foreach (var path in Directory.EnumerateFiles(directory, "*.pbs"))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var opaqueId = Path.GetFileNameWithoutExtension(path);
-            var encrypted = await File.ReadAllBytesAsync(path, cancellationToken);
-            var plain = Decrypt(encrypted, _encryptionKey, Encoding.UTF8.GetBytes(opaqueId));
-            var manifest = JsonSerializer.Deserialize<SnapshotManifest>(plain)
-                ?? throw new InvalidDataException($"Snapshot {opaqueId} is invalid.");
-            manifests.Add(manifest);
+            try
+            {
+                var encrypted = await File.ReadAllBytesAsync(path, cancellationToken);
+                var plain = Decrypt(encrypted, _encryptionKey, Encoding.UTF8.GetBytes(opaqueId));
+                var manifest = JsonSerializer.Deserialize<SnapshotManifest>(plain, RepositoryJson)
+                    ?? throw new InvalidDataException($"Snapshot {opaqueId} is invalid.");
+                ValidateManifest(manifest);
+                manifests.Add(NormalizeLegacyManifest(manifest));
+            }
+            catch (Exception error) when (
+                error is IOException or CryptographicException or JsonException or InvalidDataException)
+            {
+                _snapshotErrors.Enqueue($"{opaqueId}: {error.Message}");
+            }
         }
         return manifests.OrderByDescending(x => x.CreatedAtUtc).ToList();
     }
 
-    public Task<bool> DeleteSnapshotAsync(
+    public async Task<bool> DeleteSnapshotAsync(
         string snapshotId,
         CancellationToken cancellationToken = default)
     {
+        await using var lease = await AcquireOperationLeaseAsync(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (!Guid.TryParseExact(snapshotId, "N", out _))
             throw new ArgumentException("Snapshot ID is invalid.", nameof(snapshotId));
         var idBytes = KeyedHash(_dedupKey, Encoding.UTF8.GetBytes(snapshotId));
         var opaqueId = Convert.ToHexString(idBytes).ToLowerInvariant();
         var path = Path.Combine(_root, "snapshots", $"{opaqueId}.pbs");
-        if (!File.Exists(path)) return Task.FromResult(false);
+        if (!File.Exists(path)) return false;
         File.Delete(path);
-        return Task.FromResult(true);
+        return true;
     }
 
     public async Task<RepositoryIntegrityReport> VerifyAsync(
@@ -262,6 +361,7 @@ public sealed class EncryptedRepository
     public async Task<GarbageCollectionReport> GarbageCollectAsync(
         CancellationToken cancellationToken = default)
     {
+        await using var lease = await AcquireOperationLeaseAsync(cancellationToken);
         var snapshots = await ListSnapshotsAsync(cancellationToken);
         var reachable = snapshots.SelectMany(x => x.Components)
             .SelectMany(x => x.Files)
@@ -289,6 +389,7 @@ public sealed class EncryptedRepository
         string newPassword,
         CancellationToken cancellationToken = default)
     {
+        await using var lease = await AcquireOperationLeaseAsync(cancellationToken);
         if (newPassword.Length < 10)
             throw new ArgumentException("Repository password must contain at least 10 characters.", nameof(newPassword));
         var old = await ReadHeaderAsync(_root, cancellationToken);
@@ -308,7 +409,7 @@ public sealed class EncryptedRepository
         };
         await WriteAtomicReplaceAsync(
             Path.Combine(_root, "repository.json"),
-            JsonSerializer.SerializeToUtf8Bytes(updated),
+            JsonSerializer.SerializeToUtf8Bytes(updated, RepositoryJson),
             cancellationToken);
     }
 
@@ -575,7 +676,7 @@ public sealed class EncryptedRepository
         CancellationToken cancellationToken)
     {
         var path = ObjectPath(reference.ObjectId);
-        var payload = await File.ReadAllBytesAsync(path, cancellationToken);
+        var payload = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
         var stored = Decrypt(payload, _encryptionKey, Encoding.UTF8.GetBytes(reference.ObjectId));
         if (stored.Length == 0)
             throw new InvalidDataException($"Object {reference.ObjectId} has no compression marker.");
@@ -639,7 +740,8 @@ public sealed class EncryptedRepository
     private static async Task<RepositoryHeader> ReadHeaderAsync(string root, CancellationToken cancellationToken)
     {
         await using var stream = File.OpenRead(Path.Combine(root, "repository.json"));
-        return await JsonSerializer.DeserializeAsync<RepositoryHeader>(stream, cancellationToken: cancellationToken)
+        return await JsonSerializer.DeserializeAsync<RepositoryHeader>(
+                   stream, RepositoryJson, cancellationToken)
                ?? throw new InvalidDataException("Repository header is missing or invalid.");
     }
 
@@ -647,8 +749,22 @@ public sealed class EncryptedRepository
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         var temporary = destination + $".{Guid.NewGuid():N}.tmp";
-        await File.WriteAllBytesAsync(temporary, bytes, cancellationToken);
-        File.Move(temporary, destination, overwrite: false);
+        try
+        {
+            await File.WriteAllBytesAsync(temporary, bytes, cancellationToken);
+            try
+            {
+                File.Move(temporary, destination, overwrite: false);
+            }
+            catch (IOException) when (File.Exists(destination))
+            {
+                // A concurrent writer published the same content-addressed object first.
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 
     private static async Task WriteAtomicReplaceAsync(
@@ -660,5 +776,176 @@ public sealed class EncryptedRepository
         var temporary = destination + $".{Guid.NewGuid():N}.tmp";
         await File.WriteAllBytesAsync(temporary, bytes, cancellationToken);
         File.Move(temporary, destination, overwrite: true);
+    }
+
+    private static SnapshotManifest NormalizeLegacyManifest(SnapshotManifest manifest)
+    {
+        if (manifest.FormatVersion >= 2) return manifest;
+        var components = manifest.Components.Select(component =>
+        {
+            var expected = component.Files.LongCount(x => x.Kind == "file");
+            var captured = component.Files.LongCount(x => x.Kind == "file" && x.Chunks is not null);
+            var complete = expected == captured && component.Files.All(x =>
+                x.Kind is not ("special" or "symlink") &&
+                (x.Kind != "file" || x.Chunks is not null));
+            return component with
+            {
+                Status = complete ? ComponentStatus.Complete : ComponentStatus.Partial,
+                RestoreClass = component.Kind switch
+                {
+                    "apk" or "app-data" or "shared-storage" or "personal-data" or "system-state" =>
+                        RestoreClass.Portable,
+                    "launcher-data" => RestoreClass.ExactRom,
+                    _ => RestoreClass.ArchiveOnly
+                },
+                SchemaId = $"vexark.legacy.{component.Kind}",
+                SchemaVersion = 1,
+                Verification = new(expected, captured,
+                    component.Files.Where(x => x.Kind == "file").Sum(x => x.Size),
+                    component.Files.Where(x => x.Kind == "file" && x.Chunks is not null)
+                        .Sum(x => x.Size),
+                    complete)
+            };
+        }).ToList();
+        var partial = components.Count(x => x.Status != ComponentStatus.Complete);
+        return manifest with
+        {
+            Components = components,
+            Summary = new(
+                partial == 0 ? ComponentStatus.Complete : ComponentStatus.Partial,
+                components.Count - partial,
+                partial,
+                0,
+                0,
+                ["Legacy v1 completeness was inferred; app-data restore uses overlay staging."])
+        };
+    }
+
+    internal static void ValidateManifest(SnapshotManifest manifest)
+    {
+        if (manifest.FormatVersion < 1 || manifest.FormatVersion > 2)
+            throw new InvalidDataException($"Unsupported snapshot format {manifest.FormatVersion}.");
+        if (!Guid.TryParseExact(manifest.SnapshotId, "N", out _))
+            throw new InvalidDataException("Snapshot ID must be a 32-character GUID.");
+        if (manifest.Purpose is not ("manual" or "safety"))
+            throw new InvalidDataException("Snapshot purpose is invalid.");
+        if (manifest.Components.Select(x => x.Id).Distinct(StringComparer.Ordinal).Count() !=
+            manifest.Components.Count)
+            throw new InvalidDataException("Snapshot contains duplicate component IDs.");
+        if (manifest.FormatVersion < 2) return;
+        if (manifest.Summary is null)
+            throw new InvalidDataException("Manifest v2 requires a summary.");
+
+        foreach (var component in manifest.Components)
+        {
+            if (string.IsNullOrWhiteSpace(component.Id) || string.IsNullOrWhiteSpace(component.Kind))
+                throw new InvalidDataException("Component ID and kind are required.");
+            if (component.Status == ComponentStatus.Unknown)
+                throw new InvalidDataException($"Component {component.Id} has unknown status.");
+            if (string.IsNullOrWhiteSpace(component.SchemaId) || component.SchemaVersion < 1)
+                throw new InvalidDataException($"Component {component.Id} has no schema identity.");
+            if (component.PlainBytes < 0 || component.StoredBytes < 0)
+                throw new InvalidDataException($"Component {component.Id} contains negative sizes.");
+            if (component.Files.Select(x => x.RelativePath)
+                    .Distinct(StringComparer.Ordinal).Count() != component.Files.Count)
+                throw new InvalidDataException($"Component {component.Id} contains duplicate paths.");
+
+            foreach (var file in component.Files)
+            {
+                if (!RestorePathPolicy.IsSafeRelativePath(file.RelativePath))
+                    throw new InvalidDataException(
+                        $"Component {component.Id} contains unsafe path {file.RelativePath}.");
+                if (file.Size < 0 || file.Kind is not ("file" or "directory" or "symlink" or "special"))
+                    throw new InvalidDataException(
+                        $"Component {component.Id} contains invalid file metadata.");
+                if (file.Kind != "file") continue;
+                if (file.Chunks is null) {
+                    if (component.Status == ComponentStatus.Complete)
+                        throw new InvalidDataException(
+                            $"Complete component {component.Id} has a file without chunks.");
+                    continue;
+                }
+                if (file.Chunks.Sum(x => (long)x.PlainLength) != file.Size)
+                    throw new InvalidDataException(
+                        $"Chunk lengths do not match {component.Id}/{file.RelativePath}.");
+                if (component.Kind is "app-data" or "launcher-data" or "shared-storage" or
+                        "full" or "wallpaper" &&
+                    (file.ContentHash is not { Length: 64 } hash ||
+                     hash.Any(x => !Uri.IsHexDigit(x))))
+                    throw new InvalidDataException(
+                        $"Component {component.Id} has no whole-file BLAKE3 for {file.RelativePath}.");
+                foreach (var chunk in file.Chunks)
+                {
+                    if (chunk.ObjectId.Length != 64 ||
+                        chunk.ObjectId.Any(x => !Uri.IsHexDigit(x)) ||
+                        chunk.PlainLength <= 0 || chunk.StoredLength <= 0)
+                        throw new InvalidDataException(
+                            $"Component {component.Id} contains an invalid chunk reference.");
+                }
+            }
+
+            if (component.Status == ComponentStatus.Complete && component.Files.Any(x =>
+                    x.Kind is "special" or "symlink"))
+                throw new InvalidDataException(
+                    $"Complete component {component.Id} contains a non-restorable entry.");
+            if (component.Status == ComponentStatus.Complete &&
+                component.Verification is not { HashesVerified: true })
+                throw new InvalidDataException(
+                    $"Complete component {component.Id} has no successful verification summary.");
+            var capturedFiles = component.Files.LongCount(x =>
+                x.Kind == "file" && x.Chunks is not null);
+            var capturedBytes = component.Files.Where(x =>
+                    x.Kind == "file" && x.Chunks is not null)
+                .Sum(x => x.Size);
+            var storedBytes = component.Files.SelectMany(x => x.Chunks ?? [])
+                .Sum(x => (long)x.StoredLength);
+            if (component.PlainBytes != capturedBytes || component.StoredBytes != storedBytes)
+                throw new InvalidDataException(
+                    $"Component {component.Id} byte totals do not match its files.");
+            if (component.Verification is { } verification &&
+                (verification.CapturedFiles != capturedFiles ||
+                 verification.CapturedBytes != capturedBytes ||
+                 verification.ExpectedFiles < verification.CapturedFiles ||
+                 verification.ExpectedBytes < verification.CapturedBytes))
+                throw new InvalidDataException(
+                    $"Component {component.Id} verification totals are inconsistent.");
+        }
+
+        var complete = manifest.Components.Count(x => x.Status == ComponentStatus.Complete);
+        var partial = manifest.Components.Count(x =>
+            x.Status is ComponentStatus.Partial or ComponentStatus.Unknown);
+        var failed = manifest.Components.Count(x => x.Status == ComponentStatus.Failed);
+        var skipped = manifest.Components.Count(x => x.Status == ComponentStatus.Skipped);
+        if (manifest.Summary.CompleteComponents != complete ||
+            manifest.Summary.PartialComponents != partial ||
+            manifest.Summary.FailedComponents != failed ||
+            manifest.Summary.SkippedComponents != skipped)
+            throw new InvalidDataException("Snapshot summary counts do not match components.");
+        var meaningfulSkipped = manifest.Components.Count(x =>
+            x.Status == ComponentStatus.Skipped &&
+            x.Failures?.All(failure =>
+                failure.ErrorCode == "not_independently_available") != true);
+        var expectedStatus = failed > 0 && complete == 0
+            ? ComponentStatus.Failed
+            : partial > 0 || failed > 0 || meaningfulSkipped > 0
+                ? ComponentStatus.Partial
+                : ComponentStatus.Complete;
+        if (manifest.Summary.Status != expectedStatus)
+            throw new InvalidDataException("Snapshot summary status does not match components.");
+    }
+
+    private sealed class RepositoryLease(
+        EncryptedRepository owner,
+        FileStream stream) : IAsyncDisposable
+    {
+        private int _disposed;
+
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return ValueTask.CompletedTask;
+            stream.Dispose();
+            owner._operationGate.Release();
+            return ValueTask.CompletedTask;
+        }
     }
 }

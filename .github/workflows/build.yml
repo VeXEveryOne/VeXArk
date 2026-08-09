@@ -22,12 +22,20 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "9.0.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Test core
         run: dotnet test tests/PhoneBackup.Core.Tests/PhoneBackup.Core.Tests.csproj --configuration Release
       - name: Test desktop diagnostics
         run: dotnet test tests/PhoneBackup.Desktop.Tests/PhoneBackup.Desktop.Tests.csproj --configuration Release -p:VeXArkChannel=Dev -p:VeXArkBuildId=ci
       - name: Build desktop
         run: dotnet build src/PhoneBackup.Desktop/PhoneBackup.Desktop.csproj --configuration Release
+      - name: Validate protocol schemas
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check jsonschema==4.25.1
+          python scripts/validate_schemas.py
 
   android:
     name: Android Agent
@@ -39,6 +47,21 @@ jobs:
           distribution: temurin
           java-version: "21"
       - uses: android-actions/setup-android@v3
-      - name: Test and build debug APK
+      - name: Test, lint and build debug APK
         working-directory: agent
-        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:assembleDev --no-daemon
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDev --no-daemon
+
+  root-helper:
+    name: Restricted root helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Rust formatting
+        run: cargo fmt --manifest-path helper/Cargo.toml -- --check
+      - name: Rust tests
+        run: cargo test --manifest-path helper/Cargo.toml
+      - name: Rust clippy
+        run: cargo clippy --manifest-path helper/Cargo.toml --all-targets -- -D warnings

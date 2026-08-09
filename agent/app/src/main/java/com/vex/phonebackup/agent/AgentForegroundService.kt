@@ -15,6 +15,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 
@@ -22,10 +23,19 @@ class AgentForegroundService : Service() {
     private val running = AtomicBoolean(false)
     private val acceptor = Executors.newSingleThreadExecutor()
     private val clients = Executors.newCachedThreadPool()
+    private val restoreWatchdog = Executors.newSingleThreadScheduledExecutor()
     private var server: ServerSocket? = null
 
     override fun onCreate() {
         super.onCreate()
+        RootHelper.cleanupStalePipes(this)
+        AppSnapshotCoordinator.initialize(this)
+        restoreWatchdog.scheduleWithFixedDelay(
+            { AppSnapshotCoordinator.cleanupExpiredTransactions() },
+            1,
+            1,
+            TimeUnit.MINUTES
+        )
         AgentDiagnostics.log(
             level = "info",
             component = "service",
@@ -55,6 +65,8 @@ class AgentForegroundService : Service() {
         running.set(false)
         runCatching { server?.close() }
         FastMediaSessionManager.closeAll()
+        AppSnapshotCoordinator.abortAll()
+        restoreWatchdog.shutdownNow()
         clients.shutdownNow()
         acceptor.shutdownNow()
         AgentState.serviceRunning = false
@@ -113,6 +125,9 @@ class AgentForegroundService : Service() {
     private fun handleClient(socket: Socket) {
         socket.use {
             it.tcpNoDelay = true
+            // Every streamed operation emits frames continuously. Expire abandoned ADB-forwarded
+            // clients so a dead desktop process cannot retain a protocol worker forever.
+            it.soTimeout = 120_000
             AgentState.connectedClient = it.inetAddress.hostAddress
             AgentState.statusText = "PC connected"
             AgentDiagnostics.log(
@@ -151,7 +166,8 @@ class AgentForegroundService : Service() {
                 if (request.optString("command") in setOf(
                         "root_scan", "root_read", "shared_scan", "shared_read",
                         "personal_export", "root_restore", "shared_restore",
-                        "media_scan", "media_read", "media_read_v2", "media_probe"
+                        "media_scan", "media_read", "media_read_v2", "media_probe",
+                        "root_wallpaper_read", "wallpaper_restore", "personal_restore"
                     )) {
                     runCatching { dispatchStreaming(it, request) }
                         .onFailure { failure ->
@@ -166,7 +182,8 @@ class AgentForegroundService : Service() {
                                 fields = mapOf("command" to request.optString("command"))
                             )
                             runCatching {
-                                error(it, "command_failed", failure.message.orEmpty())
+                                error(it, "command_failed", failure.message.orEmpty(),
+                                    request.optString("requestId"))
                             }
                         }
                     continue
@@ -184,11 +201,11 @@ class AgentForegroundService : Service() {
                             fields = mapOf("command" to request.optString("command"))
                         )
                         runCatching {
-                            error(it, "command_failed", failure.message.orEmpty())
+                            error(it, "command_failed", failure.message.orEmpty(),
+                                request.optString("requestId"))
                         }
                     }
             }
-            RootHelper.cleanup(this)
             AgentState.connectedClient = null
             AgentState.statusText = "Waiting for VeXArk Desktop"
             AgentDiagnostics.log(
@@ -238,7 +255,7 @@ class AgentForegroundService : Service() {
             "hello" -> {
                 response.put("ok", true)
                     .put("agentVersion", BuildConfig.VERSION_NAME)
-                    .put("helperVersion", "rust-0.1.0")
+                    .put("helperVersion", "rust-0.2.0")
                     .put(
                         "build",
                         JSONObject()
@@ -255,7 +272,10 @@ class AgentForegroundService : Service() {
                         "personal-data", "root-scan", "root-read", "root-restore",
                         "shared-restore", "media-export", "account-inventory",
                         "package-policy", "restore-approval", "media-export-v2",
-                        "fast-lan-aead-v1", "diagnostics-v1"
+                        "fast-lan-aead-v1", "diagnostics-v1", "rom-identity-v1",
+                        "settings-catalog-v2", "typed-data-roots-v1",
+                        "transactional-app-restore-v1", "stream-request-id-v1",
+                        "wallpaper-api-restore-v1"
                     )))
             }
             "pair" -> {
@@ -277,6 +297,8 @@ class AgentForegroundService : Service() {
             "packages" -> authorized(desktopKey, response) {
                 val includeSystemApps = request.optJSONObject("payload")
                     ?.optBoolean("includeSystemApps", false) == true
+                val hashArtifacts = request.optJSONObject("payload")
+                    ?.optBoolean("hashArtifacts", true) != false
                 val requested = request.optJSONObject("payload")
                     ?.optJSONArray("packageNames")
                     ?.let { array ->
@@ -285,7 +307,8 @@ class AgentForegroundService : Service() {
                         }
                     }
                 response.put("ok", true)
-                    .put("packages", AgentInventory.packages(this, includeSystemApps, requested))
+                    .put("packages", AgentInventory.packages(
+                        this, includeSystemApps, requested, hashArtifacts))
             }
             "root_request" -> authorized(desktopKey, response) {
                 val root = RootCapabilities.probe(requestGrant = true)
@@ -348,18 +371,32 @@ class AgentForegroundService : Service() {
                 response.put("ok", true).put("state", SystemStateExporter.export(this))
             }
             "restore_prepare" -> authorized(desktopKey, response) {
-                val packageName = request.optJSONObject("payload")?.optString("packageName").orEmpty()
+                val payload = request.optJSONObject("payload") ?: JSONObject()
+                val packageName = payload.optString("packageName")
+                val roots = payload.optJSONArray("roots")?.let { array ->
+                    (0 until array.length()).map { array.optString(it) }.filter(String::isNotBlank)
+                }.orEmpty()
                 val root = RootCapabilities.probe(requestGrant = true)
-                val prepared = root.granted && AppSnapshotCoordinator.prepareRestore(packageName)
-                response.put("ok", prepared)
-                    .put("error", if (prepared) JSONObject.NULL else "restore_prepare_failed")
+                val prepared = if (root.granted) AppSnapshotCoordinator.prepareRestore(
+                    this, packageName, roots, payload.optBoolean("completeSnapshot", false)
+                ) else JSONObject().put("ok", false).put("error", "root_required")
+                response.put("ok", prepared.optBoolean("ok"))
+                    .put("transactionId", prepared.opt("transactionId") ?: JSONObject.NULL)
+                    .put("rootCount", prepared.optInt("rootCount", 0))
+                    .put("error", prepared.opt("error") ?: JSONObject.NULL)
             }
             "restore_finish" -> authorized(desktopKey, response) {
                 val packageName = request.optJSONObject("payload")?.optString("packageName").orEmpty()
                 val root = RootCapabilities.probe(requestGrant = true)
-                val finished = root.granted && AppSnapshotCoordinator.finishRestore(packageName)
-                response.put("ok", finished)
-                    .put("error", if (finished) JSONObject.NULL else "restore_finish_failed")
+                val finished = if (root.granted) AppSnapshotCoordinator.finishRestore(packageName)
+                    else JSONObject().put("ok", false).put("error", "root_required")
+                response.put("ok", finished.optBoolean("ok"))
+                    .put("rolledBack", finished.optBoolean("rolledBack", false))
+                    .put("error", finished.opt("error") ?: JSONObject.NULL)
+            }
+            "restore_abort" -> authorized(desktopKey, response) {
+                val packageName = request.optJSONObject("payload")?.optString("packageName").orEmpty()
+                response.put("ok", AppSnapshotCoordinator.abortRestore(packageName))
             }
             "restore_policy" -> authorized(desktopKey, response) {
                 val payload = request.optJSONObject("payload") ?: JSONObject()
@@ -371,7 +408,8 @@ class AgentForegroundService : Service() {
                         payload.optString("packageName"),
                         payload.optBoolean("enabled"),
                         payload.optBoolean("batteryOptimizationExempt"),
-                        payload.optJSONArray("runtimePermissions") ?: JSONArray()
+                        payload.optJSONArray("runtimePermissions") ?: JSONArray(),
+                        payload.optString("appLocales")
                     )
                     response.put("ok", result.optBoolean("ok"))
                         .put("failures", result.optJSONArray("failures") ?: JSONArray())
@@ -383,12 +421,19 @@ class AgentForegroundService : Service() {
                 if (!root.granted) {
                     response.put("ok", false).put("error", "root_required")
                 } else {
+                    val confirmed = payload.optJSONArray("confirmedSettingIds")?.let { array ->
+                        buildSet { for (index in 0 until array.length()) add(array.optString(index)) }
+                    }.orEmpty()
                     val result = SystemStateExporter.restore(
                         this,
-                        payload.optJSONObject("state") ?: JSONObject()
+                        payload.optJSONObject("state") ?: JSONObject(),
+                        confirmed
                     )
-                    response.put("ok", result.optBoolean("ok"))
+                    response.put("ok", true)
+                        .put("appliedWithoutFailures", result.optBoolean("ok"))
                         .put("failures", result.optJSONArray("failures") ?: JSONArray())
+                        .put("needsConfirmation", result.optJSONArray("needsConfirmation") ?: JSONArray())
+                        .put("outcomes", result.optJSONArray("outcomes") ?: JSONArray())
                 }
             }
             "snapshot_begin" -> authorized(desktopKey, response) {
@@ -453,7 +498,7 @@ class AgentForegroundService : Service() {
         )
         val authenticationError = RequestSecurity.verify(request)
         if (authenticationError != null) {
-            error(socket, authenticationError, "Signed request validation failed")
+            error(socket, authenticationError, "Signed request validation failed", requestId)
             AgentDiagnostics.log(
                 level = "warn",
                 component = "protocol",
@@ -468,7 +513,7 @@ class AgentForegroundService : Service() {
         }
         val desktopKey = request.optString("desktopKey")
         if (!isTrusted(desktopKey)) {
-            error(socket, "not_paired", "Desktop is not paired")
+            error(socket, "not_paired", "Desktop is not paired", requestId)
             AgentDiagnostics.log(
                 level = "warn",
                 component = "protocol",
@@ -488,7 +533,7 @@ class AgentForegroundService : Service() {
                 RootCapabilities.probe(requestGrant = true)
             }
             if (root?.granted == false) {
-                error(socket, "root_required", root.detail)
+                error(socket, "root_required", root.detail, requestId)
                 AgentDiagnostics.log(
                     level = "warn",
                     component = "protocol",
@@ -502,15 +547,48 @@ class AgentForegroundService : Service() {
                 return
             }
         }
-        if (command == "root_restore" || command == "shared_restore") {
+        if (command in setOf(
+                "root_restore", "shared_restore", "wallpaper_restore", "personal_restore")) {
             ProtocolFrameIo.writeJson(
                 socket.getOutputStream(),
                 FrameType.RESPONSE,
-                JSONObject().put("ok", true).put("ready", true)
+                JSONObject()
+                    .put("protocolVersion", PROTOCOL_VERSION)
+                    .put("requestId", requestId)
+                    .put("ok", true)
+                    .put("ready", true)
             )
         }
         val payload = request.optJSONObject("payload") ?: JSONObject()
-        val rootPath = payload.optString("root")
+        var inboundTerminalConsumed = false
+        val requestedRootPath = payload.optString("root")
+        val rootPath = if (command == "root_restore") {
+            AppSnapshotCoordinator.resolveRestoreRoot(
+                payload.optString("packageName"), requestedRootPath
+            ) ?: requestedRootPath
+        } else requestedRootPath
+        if (command == "personal_restore") {
+            val result = PersonalDataImporter.restore(this, payload.optString("kind")) { output ->
+                while (true) {
+                    val frame = ProtocolFrameIo.read(socket.getInputStream())
+                    when (frame.type) {
+                        FrameType.DATA -> output.write(frame.payload)
+                        FrameType.END -> {
+                            inboundTerminalConsumed = true
+                            break
+                        }
+                        FrameType.ABORT -> {
+                            inboundTerminalConsumed = true
+                            throw IllegalStateException("stream_aborted")
+                        }
+                        else -> throw IllegalArgumentException(
+                            "Expected DATA, END or ABORT during personal restore")
+                    }
+                }
+            }
+            ProtocolFrameIo.writeJson(socket.getOutputStream(), FrameType.END, result)
+            return
+        }
         if (command == "media_read_v2" || command == "media_probe") {
             val result = if (command == "media_probe") {
                 MediaStoreAccess.probe(payload.optLong("length", 0)) { buffer, count ->
@@ -583,6 +661,12 @@ class AgentForegroundService : Service() {
             ) { bytes ->
                 ProtocolFrameIo.write(socket.getOutputStream(), FrameType.DATA, bytes)
             }
+            "root_wallpaper_read" -> RootHelper.readWallpaper(
+                this,
+                payload.optString("kind")
+            ) { bytes ->
+                ProtocolFrameIo.write(socket.getOutputStream(), FrameType.DATA, bytes)
+            }
             "root_restore" -> {
                 val kind = payload.optString("kind")
                 if (kind == "directory") {
@@ -590,6 +674,7 @@ class AgentForegroundService : Service() {
                     if (frame.type != FrameType.END) {
                         throw IllegalArgumentException("Directory restore requires an empty stream")
                     }
+                    inboundTerminalConsumed = true
                     RootHelper.restoreDirectory(
                         this,
                         rootPath,
@@ -598,7 +683,7 @@ class AgentForegroundService : Service() {
                         payload.optInt("uid"),
                         payload.optInt("gid"),
                         payload.optLong("modifiedUnixNanos"),
-                        payload.optString("selinuxLabel").takeIf { it.isNotBlank() }
+                        payloadNullableString(payload, "selinuxLabel")
                     )
                 } else if (kind == "file") {
                     RootHelper.restore(
@@ -609,15 +694,24 @@ class AgentForegroundService : Service() {
                         payload.optInt("uid"),
                         payload.optInt("gid"),
                         payload.optLong("modifiedUnixNanos"),
-                        payload.optString("selinuxLabel").takeIf { it.isNotBlank() }
+                        payload.optLong("expectedSize", -1),
+                        payloadNullableString(payload, "expectedBlake3"),
+                        payloadNullableString(payload, "selinuxLabel")
                     ) { output ->
                         while (true) {
                             val frame = ProtocolFrameIo.read(socket.getInputStream())
                             when (frame.type) {
                                 FrameType.DATA -> output.write(frame.payload)
-                                FrameType.END -> break
+                                FrameType.END -> {
+                                    inboundTerminalConsumed = true
+                                    break
+                                }
+                                FrameType.ABORT -> {
+                                    inboundTerminalConsumed = true
+                                    throw IllegalStateException("stream_aborted")
+                                }
                                 else -> throw IllegalArgumentException(
-                                    "Expected DATA or END during root restore"
+                                    "Expected DATA, END or ABORT during root restore"
                                 )
                             }
                         }
@@ -643,15 +737,48 @@ class AgentForegroundService : Service() {
                 rootPath,
                 payload.optString("relative"),
                 payload.optString("kind"),
-                payload.optLong("modifiedUnixNanos")
+                payload.optLong("modifiedUnixNanos"),
+                payload.optLong("expectedSize", -1),
+                payloadNullableString(payload, "expectedBlake3")
             ) { output ->
                 while (true) {
                     val frame = ProtocolFrameIo.read(socket.getInputStream())
                     when (frame.type) {
                         FrameType.DATA -> output.write(frame.payload)
-                        FrameType.END -> break
+                        FrameType.END -> {
+                            inboundTerminalConsumed = true
+                            break
+                        }
+                        FrameType.ABORT -> {
+                            inboundTerminalConsumed = true
+                            throw IllegalStateException("stream_aborted")
+                        }
                         else -> throw IllegalArgumentException(
-                            "Expected DATA or END during shared restore"
+                            "Expected DATA, END or ABORT during shared restore"
+                        )
+                    }
+                }
+            }
+            "wallpaper_restore" -> WallpaperAccess.restore(
+                this,
+                payload.optString("kind"),
+                payload.optLong("expectedSize", -1),
+                payloadNullableString(payload, "expectedBlake3")
+            ) { output ->
+                while (true) {
+                    val frame = ProtocolFrameIo.read(socket.getInputStream())
+                    when (frame.type) {
+                        FrameType.DATA -> output.write(frame.payload)
+                        FrameType.END -> {
+                            inboundTerminalConsumed = true
+                            break
+                        }
+                        FrameType.ABORT -> {
+                            inboundTerminalConsumed = true
+                            throw IllegalStateException("stream_aborted")
+                        }
+                        else -> throw IllegalArgumentException(
+                            "Expected DATA, END or ABORT during wallpaper restore"
                         )
                     }
                 }
@@ -684,7 +811,13 @@ class AgentForegroundService : Service() {
                 JSONObject().put("ok", true)
             )
         } else {
-            error(socket, "helper_failed", "Root helper command failed")
+            if (command in setOf(
+                    "root_restore", "shared_restore", "wallpaper_restore") &&
+                !inboundTerminalConsumed
+            ) {
+                drainInboundRestore(socket)
+            }
+            error(socket, "helper_failed", "Root helper command failed", requestId)
         }
         AgentDiagnostics.log(
             level = if (success) "info" else "warn",
@@ -698,6 +831,22 @@ class AgentForegroundService : Service() {
         )
     }
 
+    private fun drainInboundRestore(socket: Socket) {
+        while (true) {
+            when (ProtocolFrameIo.read(socket.getInputStream()).type) {
+                FrameType.DATA -> Unit
+                FrameType.END, FrameType.ABORT -> return
+                else -> throw IllegalArgumentException(
+                    "Expected DATA, END or ABORT while draining failed restore")
+            }
+        }
+    }
+
+    private fun payloadNullableString(payload: JSONObject, name: String): String? =
+        payload.optString(name).takeIf {
+            it.isNotBlank() && !it.equals("null", ignoreCase = true)
+        }
+
     private inline fun authorized(key: String, response: JSONObject, block: () -> Unit) {
         if (!isTrusted(key)) {
             response.put("ok", false).put("error", "not_paired")
@@ -710,11 +859,15 @@ class AgentForegroundService : Service() {
         key.isNotBlank() && getSharedPreferences(PREFS, MODE_PRIVATE)
             .getStringSet(KEY_TRUSTED, emptySet()).orEmpty().contains(key)
 
-    private fun error(socket: Socket, code: String, message: String) {
+    private fun error(socket: Socket, code: String, message: String, requestId: String = "") {
         ProtocolFrameIo.writeJson(
             socket.getOutputStream(),
             FrameType.ERROR,
-            JSONObject().put("error", code).put("message", message)
+            JSONObject()
+                .put("protocolVersion", PROTOCOL_VERSION)
+                .put("requestId", requestId)
+                .put("error", code)
+                .put("message", message)
         )
     }
 
@@ -743,7 +896,7 @@ class AgentForegroundService : Service() {
     companion object {
         const val CHANNEL_ID = "phonebackup_operations"
         val PORT: Int = BuildConfig.AGENT_PORT
-        const val PROTOCOL_VERSION = 1
+        const val PROTOCOL_VERSION = 2
         const val PREFS = "agent_security"
         const val KEY_TRUSTED = "trusted_desktop_keys"
         private val NOTIFICATION_ID: Int = BuildConfig.AGENT_PORT

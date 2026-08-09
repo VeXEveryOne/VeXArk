@@ -155,7 +155,9 @@
                                                FontSize="12" TextWrapping="Wrap" Margin="0,7,0,0"/>
                                 </StackPanel>
                             </Border>
-                            <ProgressBar IsIndeterminate="{Binding IsBusy}"/>
+                            <ProgressBar IsIndeterminate="{Binding OperationProgressIndeterminate}"
+                                         Value="{Binding OperationProgress}"
+                                         Minimum="0" Maximum="100"/>
                             <Button Content="{Binding CancelOperationText}"
                                     Command="{Binding CancelOperationCommand}"
                                     Visibility="{Binding CancelOperationVisibility}"
@@ -324,8 +326,12 @@
                                                        Foreground="{DynamicResource TextMutedBrush}" Margin="0,5,0,18"/>
                                             <CheckBox Content="Приложения и split APK"
                                                       IsChecked="{Binding BackupApps}" Margin="0,6"/>
-                                            <CheckBox Content="Приватные данные приложений — нужен root"
+                                            <CheckBox Content="Приватные данные приложений и рабочего стола — нужен root"
                                                       IsChecked="{Binding BackupAppData}" Margin="0,6"/>
+                                            <TextBlock
+                                                Text="Включает раскладку активного Launcher и порядок плиток быстрых настроек."
+                                                Foreground="{DynamicResource TextMutedBrush}"
+                                                FontSize="12" TextWrapping="Wrap" Margin="25,-2,0,4"/>
                                             <CheckBox Content="Документы, загрузки, музыка и аудио"
                                                       IsChecked="{Binding BackupSharedStorage}" Margin="0,6"/>
                                             <CheckBox Content="Контакты, SMS, звонки и список аккаунтов"
@@ -663,6 +669,10 @@
                                                 Text="Перед восстановлением VeXArk проверит ROM, подписи приложений и опасные компоненты."
                                             Foreground="{DynamicResource TextMutedBrush}"
                                             TextWrapping="Wrap" Margin="0,6,0,14"/>
+                                        <TextBlock Text="Пароль хранилища"
+                                                   Style="{StaticResource LabelStyle}"/>
+                                        <PasswordBox PasswordChanged="RepositoryPassword_OnPasswordChanged"
+                                                     Margin="0,6,0,12"/>
                                         <Button Content="Загрузить список копий"
                                                 Command="{Binding LoadSnapshotsCommand}"
                                                 HorizontalAlignment="Left" Margin="0,0,0,12"/>
@@ -693,11 +703,61 @@
                                                      MinHeight="190"
                                                      VerticalScrollBarVisibility="Auto"
                                                      Margin="0,14,0,12"/>
+                                            <TextBlock Text="Ход операции"
+                                                       FontWeight="SemiBold"
+                                                       Margin="0,2,0,8"/>
+                                            <ListBox ItemsSource="{Binding OperationItems}"
+                                                     Height="230"
+                                                     ScrollViewer.CanContentScroll="True"
+                                                     VirtualizingPanel.IsVirtualizing="True"
+                                                     VirtualizingPanel.VirtualizationMode="Recycling"
+                                                     Margin="0,0,0,12">
+                                                <ListBox.ItemsPanel>
+                                                    <ItemsPanelTemplate>
+                                                        <VirtualizingStackPanel/>
+                                                    </ItemsPanelTemplate>
+                                                </ListBox.ItemsPanel>
+                                                <ListBox.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid Margin="0,3">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="110"/>
+                                                                <ColumnDefinition Width="*"/>
+                                                                <ColumnDefinition Width="80"/>
+                                                            </Grid.ColumnDefinitions>
+                                                            <StackPanel>
+                                                                <TextBlock Text="{Binding StateLabel}"
+                                                                           FontWeight="SemiBold"
+                                                                           FontSize="11"/>
+                                                                <TextBlock Text="{Binding Stage}"
+                                                                           Foreground="{DynamicResource TextMutedBrush}"
+                                                                           FontSize="10"
+                                                                           TextTrimming="CharacterEllipsis"/>
+                                                            </StackPanel>
+                                                            <StackPanel Grid.Column="1" Margin="7,0">
+                                                                <TextBlock Text="{Binding Item}"
+                                                                           TextTrimming="CharacterEllipsis"/>
+                                                                <TextBlock Text="{Binding Message}"
+                                                                           Foreground="{DynamicResource TextMutedBrush}"
+                                                                           FontSize="10"
+                                                                           TextWrapping="Wrap"/>
+                                                            </StackPanel>
+                                                            <TextBlock Grid.Column="2"
+                                                                       Text="{Binding Progress}"
+                                                                       HorizontalAlignment="Right"
+                                                                       Foreground="{DynamicResource TextMutedBrush}"/>
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ListBox.ItemTemplate>
+                                            </ListBox>
                                             <CheckBox
                                                 Content="Разрешить downgrade APK после предупреждения"
                                                 IsChecked="{Binding AllowDowngrade}"/>
                                         </StackPanel>
                                     </Border>
+                                    <Button Content="Сравнить с телефоном"
+                                            Command="{Binding CompareRestoreCommand}"
+                                            Margin="0,0,0,9"/>
                                     <Button Content="Проверить и восстановить"
                                             Style="{StaticResource PrimaryButtonStyle}"
                                             Command="{Binding RestoreSnapshotCommand}"/>

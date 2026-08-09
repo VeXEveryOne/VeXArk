@@ -45,11 +45,12 @@ $javaHome = $javaCandidates |
     } |
     Select-Object -First 1
 $embedded = Join-Path $projectRoot "src\PhoneBackup.Desktop\Embedded"
-$publish = if ($Channel -eq "Dev") {
+$publishFinal = if ($Channel -eq "Dev") {
     Join-Path $projectRoot "artifacts\dev\publish"
 } else {
     Join-Path $projectRoot "artifacts\publish"
 }
+$artifactsRoot = Join-Path $projectRoot "artifacts"
 $releaseArtifacts = Join-Path $projectRoot "artifacts\release"
 $devArtifacts = Join-Path $projectRoot "artifacts\dev"
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
@@ -75,6 +76,24 @@ if (-not (Test-Path (Join-Path $androidSdk "platform-tools\adb.exe"))) {
 }
 if (-not (Test-Path $cargo)) { throw "Rust/Cargo не найден: $cargo" }
 if (-not (Test-Path $ndkHome)) { throw "Android NDK 29 не найден: $ndkHome" }
+if ($Channel -eq "Stable" -and $Configuration -eq "Release") {
+    $requiredSigning = @(
+        "VEXARK_KEYSTORE_PATH",
+        "VEXARK_KEYSTORE_PASSWORD",
+        "VEXARK_KEY_ALIAS",
+        "VEXARK_KEY_PASSWORD"
+    )
+    $missingSigning = $requiredSigning | Where-Object {
+        [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+    }
+    if ($missingSigning.Count -gt 0) {
+        throw "Stable Release требует production signing: отсутствуют " +
+              ($missingSigning -join ", ")
+    }
+    if (-not (Test-Path -LiteralPath $env:VEXARK_KEYSTORE_PATH)) {
+        throw "Production keystore не найден: $env:VEXARK_KEYSTORE_PATH"
+    }
+}
 
 $gitSha = (& git -C $projectRoot rev-parse --short=12 HEAD 2>$null).Trim()
 if ([string]::IsNullOrWhiteSpace($gitSha)) { $gitSha = "local" }
@@ -111,7 +130,7 @@ try {
     } else {
         ":app:assembleDebug"
     }
-    & ".\gradlew.bat" ":app:testDebugUnitTest" $agentTask "--no-daemon"
+    & ".\gradlew.bat" ":app:testDebugUnitTest" ":app:lintDebug" $agentTask "--no-daemon"
     if ($LASTEXITCODE -ne 0) { throw "Сборка Android Agent завершилась ошибкой." }
 }
 finally {
@@ -190,6 +209,18 @@ $projectVersion = @($projectProperties.Project.PropertyGroup.Version) |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     Select-Object -First 1
 $projectVersion = $projectVersion.Trim()
+$stagingRoot = Join-Path $artifactsRoot "staging"
+$stageName = "{0}-{1}-{2}" -f $Channel.ToLowerInvariant(), $projectVersion, $buildId
+$publish = Join-Path $stagingRoot $stageName
+New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+$resolvedArtifacts = [IO.Path]::GetFullPath($artifactsRoot) + [IO.Path]::DirectorySeparatorChar
+$resolvedPublish = [IO.Path]::GetFullPath($publish)
+if (-not $resolvedPublish.StartsWith($resolvedArtifacts, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Небезопасный staging path: $resolvedPublish"
+}
+if (Test-Path -LiteralPath $publish) {
+    Remove-Item -LiteralPath $publish -Recurse -Force
+}
 $apkMetadata = Get-Content -Raw $apkMetadataPath | ConvertFrom-Json
 $apkVersion = $apkMetadata.elements[0].versionName
 $expectedApkVersion = if ($Channel -eq "Dev") { "$projectVersion-dev" } else { $projectVersion }
@@ -237,6 +268,38 @@ Copy-Item (Join-Path $projectRoot "LICENSE") (Join-Path $publish "LICENSE.txt") 
 Copy-Item (Join-Path $projectRoot "NOTICE") (Join-Path $publish "NOTICE.txt") -Force
 
 $exeName = if ($Channel -eq "Dev") { "VeXArk-Dev.exe" } else { "VeXArk.exe" }
+$exe = Join-Path $publish $exeName
+$previousPublish = "$publishFinal.previous-$buildId"
+$publishFinalParent = Split-Path -Parent $publishFinal
+New-Item -ItemType Directory -Force -Path $publishFinalParent | Out-Null
+$resolvedPrevious = [IO.Path]::GetFullPath($previousPublish)
+if (-not $resolvedPrevious.StartsWith($resolvedArtifacts, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Небезопасный previous publish path: $resolvedPrevious"
+}
+if (Test-Path -LiteralPath $previousPublish) {
+    Remove-Item -LiteralPath $previousPublish -Recurse -Force
+}
+$movedPrevious = $false
+try {
+    if (Test-Path -LiteralPath $publishFinal) {
+        Move-Item -LiteralPath $publishFinal -Destination $previousPublish
+        $movedPrevious = $true
+    }
+    Move-Item -LiteralPath $publish -Destination $publishFinal
+}
+catch {
+    if ($movedPrevious -and
+        -not (Test-Path -LiteralPath $publishFinal) -and
+        (Test-Path -LiteralPath $previousPublish)) {
+        Move-Item -LiteralPath $previousPublish -Destination $publishFinal
+    }
+    throw "Не удалось безопасно заменить publish. Закройте VeXArk и повторите сборку. " +
+          "Готовый staging сохранён в $publish. $($_.Exception.Message)"
+}
+if (Test-Path -LiteralPath $previousPublish) {
+    Remove-Item -LiteralPath $previousPublish -Recurse -Force
+}
+$publish = $publishFinal
 $exe = Join-Path $publish $exeName
 if ($Channel -eq "Dev") {
     New-Item -ItemType Directory -Force -Path $devArtifacts | Out-Null

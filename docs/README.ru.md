@@ -58,6 +58,13 @@ Windows-клиент portable: внутри уже лежат совместим
 - Material You на Android.
 - Английский язык по умолчанию и переключение на русский в обоих клиентах.
 
+Исходники открытых ROM можно проверять без установки прошивки через
+`scripts/rom_catalog.py`. Seed-список прошивок Xiaomi 13 (`fuxi`) находится в
+`catalog/rom-sources/xiaomi-13-fuxi.json`, подробности — в
+[`ROM_SOURCE_CATALOG.md`](ROM_SOURCE_CATALOG.md). Найденный ключ не разрешается
+для Restore автоматически: обязательны типизированная проверка, capability,
+read-back и rollback.
+
 ## Скриншоты
 
 | Светлая | Тёмная |
@@ -66,13 +73,24 @@ Windows-клиент portable: внутри уже лежат совместим
 
 ## Режимы
 
-**Portable** предназначен для переноса между ROM: APK/splits, приватные данные
-с root, permissions/app-ops, контакты, SMS, звонки, документы, музыка и безопасные
-Android-настройки.
+**Portable** предназначен для переноса между ROM: APK/splits, CE/DE,
+`/Android/data` и OBB с root, опасные runtime-permissions, enabled state,
+исключение из оптимизации батареи, per-app locales, контакты и журнал звонков с
+дедупликацией, документы/музыка и типизированные безопасные Android-настройки.
+SMS/MMS пока сохраняются только как зашифрованный архив: автоматическая запись
+без временной роли SMS-приложения не выдаётся за успешное восстановление.
 
-**Controlled Full** добавляет ROM-зависимые данные — отдельные настройки Wi-Fi,
-launcher/SystemUI и сведения о root-модулях. Такие компоненты проходят строгую
-проверку совместимости и не восстанавливаются автоматически.
+**Controlled Full** добавляет archive-only снимки выбранных Wi-Fi internals и
+файлов модулей KernelSU/Magisk. Данные совместимого Launcher3 имеют класс
+`ExactRom` и применяются только после проверки полной ROM identity, подписи
+пакета и создания safety snapshot. Archive-only компоненты автоматически не
+применяются.
+
+Каталог настроек покрывает AOSP, Lineage и crDroid, отдельно показывает
+`Supported`, `Archived` и `Ignored`. Неизвестные provider-ключи сохраняются в
+зашифрованном отчёте по именам, но их значения не записываются обратно. Внутренние
+XiaomiParts, GameSpace, LiveDisplay и charging control остаются archive-only,
+пока для конкретной версии нет проверенного semantic adapter.
 
 Android Keystore, PIN, биометрия, eSIM, Wallet, DRM-ключи и аппаратно привязанные
 passkeys никогда не копируются. Для Google-аккаунтов сохраняется только

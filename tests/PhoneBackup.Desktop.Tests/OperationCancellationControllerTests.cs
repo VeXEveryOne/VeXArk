@@ -65,6 +65,7 @@ public sealed class OperationCancellationControllerTests
 
             await entered.Task;
             Assert.True(viewModel.IsBusy);
+            Assert.True(viewModel.OperationProgressIndeterminate);
             Assert.True(viewModel.CanCancelOperation);
             Assert.Equal(Visibility.Visible, viewModel.CancelOperationVisibility);
             Assert.True(viewModel.CancelOperationCommand.CanExecute(null));
@@ -73,6 +74,7 @@ public sealed class OperationCancellationControllerTests
             await operation;
 
             Assert.False(viewModel.IsBusy);
+            Assert.False(viewModel.OperationProgressIndeterminate);
             Assert.False(viewModel.CanCancelOperation);
             Assert.Equal(Visibility.Collapsed, viewModel.CancelOperationVisibility);
             Assert.Equal("cancelled", viewModel.StatusText);

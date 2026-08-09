@@ -35,10 +35,16 @@ public sealed class SnapshotViewModel
 {
     public SnapshotViewModel(SnapshotManifest manifest) => Manifest = manifest;
     public SnapshotManifest Manifest { get; }
+    private int AppCount => Manifest.Components
+        .Where(x => x.Package is not null)
+        .Select(x => x.Package!.PackageName)
+        .Distinct(StringComparer.Ordinal)
+        .Count();
     public string Title =>
-        $"{Manifest.CreatedAtUtc.ToLocalTime():g} • {Manifest.Components.Count} {LocalizationManager.T("приложений")}";
+        $"{Manifest.CreatedAtUtc.ToLocalTime():g} • {AppCount} {LocalizationManager.T("приложений")}";
     public string Details =>
         $"{(Manifest.Purpose == "safety" ? "Safety snapshot" : Manifest.Mode.ToString())} • " +
+        $"{Manifest.Components.Count} компонентов • " +
         $"{FormatBytes(Manifest.Components.Sum(x => x.PlainBytes))} • {Manifest.SnapshotId[..12]}";
 
     private static string FormatBytes(long value) =>
@@ -68,15 +74,59 @@ public sealed class PackageSelectionViewModel(PackageSnapshot package) : INotify
     public event PropertyChangedEventHandler? PropertyChanged;
 }
 
+public sealed class OperationProgressItemViewModel : INotifyPropertyChanged
+{
+    private string _stage = string.Empty;
+    private string _item = string.Empty;
+    private RestoreItemState _state;
+    private string _progress = string.Empty;
+    private string _message = string.Empty;
+
+    public required string Key { get; init; }
+    public string Stage { get => _stage; set => Set(ref _stage, value); }
+    public string Item { get => _item; set => Set(ref _item, value); }
+    public RestoreItemState State { get => _state; set { if (Set(ref _state, value)) Raise(nameof(StateLabel)); } }
+    public string StateLabel => State switch
+    {
+        RestoreItemState.Pending => "Ожидает",
+        RestoreItemState.Running => "Выполняется",
+        RestoreItemState.NeedsUser => "Нужно действие",
+        RestoreItemState.Succeeded => "Готово",
+        RestoreItemState.Skipped => "Пропущено",
+        RestoreItemState.Failed => "Ошибка",
+        RestoreItemState.RolledBack => "Откат выполнен",
+        _ => State.ToString()
+    };
+    public string Progress { get => _progress; set => Set(ref _progress, value); }
+    public string Message { get => _message; set => Set(ref _message, value); }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private bool Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value)) return false;
+        field = value;
+        Raise(name);
+        return true;
+    }
+
+    private void Raise([CallerMemberName] string? name = null) =>
+        PropertyChanged?.Invoke(this, new(name));
+}
+
 public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly AdbService _adb;
     private readonly IPhoneMediaImportCoordinator _iPhoneMedia = new();
     private readonly Dictionary<string, string> _mediaTransports = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, OperationProgressItemViewModel> _operationItemsByKey =
+        new(StringComparer.Ordinal);
     private readonly OperationCancellationController _operationCancellation = new();
     private string _page = "devices";
     private string _statusText = "Готово";
     private bool _isBusy;
+    private double _operationProgress;
+    private bool _operationProgressIndeterminate;
     private DeviceViewModel? _selectedDevice;
     private SnapshotViewModel? _selectedSnapshot;
     private IPhoneMediaSourceViewModel? _selectedIPhoneSource;
@@ -105,6 +155,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public ObservableCollection<SnapshotViewModel> Snapshots { get; } = [];
     public ObservableCollection<PackageSelectionViewModel> BackupPackages { get; } = [];
     public ObservableCollection<string> DiagnosticLines { get; } = [];
+    public ObservableCollection<OperationProgressItemViewModel> OperationItems { get; } = [];
 
     public string PageTitle => LocalizationManager.T(_page switch
     {
@@ -159,6 +210,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set => Set(ref _diagnosticsSummary, value);
     }
     public bool IsBusy { get => _isBusy; set => Set(ref _isBusy, value); }
+    public double OperationProgress
+    {
+        get => _operationProgress;
+        set => Set(ref _operationProgress, Math.Clamp(value, 0, 100));
+    }
+    public bool OperationProgressIndeterminate
+    {
+        get => _operationProgressIndeterminate;
+        set => Set(ref _operationProgressIndeterminate, value);
+    }
     public bool CanCancelOperation => _operationCancellation.CanCancel;
     public Visibility CancelOperationVisibility =>
         _operationCancellation.IsActive ? Visibility.Visible : Visibility.Collapsed;
@@ -368,6 +429,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public AsyncRelayCommand StartBackupCommand { get; }
     public RelayCommand CancelOperationCommand { get; }
     public AsyncRelayCommand LoadSnapshotsCommand { get; }
+    public AsyncRelayCommand CompareRestoreCommand { get; }
     public AsyncRelayCommand RestoreSnapshotCommand { get; }
     public AsyncRelayCommand VerifyRepositoryCommand { get; }
     public AsyncRelayCommand GarbageCollectCommand { get; }
@@ -423,6 +485,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _ => CancelActiveOperation(),
             _ => CanCancelOperation);
         LoadSnapshotsCommand = new(LoadSnapshotsAsync);
+        CompareRestoreCommand = new(CompareRestoreAsync);
         RestoreSnapshotCommand = new(RestoreSnapshotAsync);
         VerifyRepositoryCommand = new(VerifyRepositoryAsync);
         GarbageCollectCommand = new(GarbageCollectAsync);
@@ -853,7 +916,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
                     TimeSpan.FromSeconds(60),
                     new Progress<string>(x => StatusText = x)))
                 throw new UnauthorizedAccessException("Компьютер не подтверждён.");
-            var packages = await agent.GetPackagesAsync(includeSystemApps: false);
+            var packages = await agent.GetPackagesAsync(
+                includeSystemApps: false,
+                hashArtifacts: false);
             BackupPackages.Clear();
             foreach (var package in packages.OrderBy(x => x.Label))
                 BackupPackages.Add(new(package));
@@ -925,15 +990,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 throw new TimeoutException("Компьютер не был подтверждён на телефоне.");
 
             StatusText = "Инвентаризация приложений и APK…";
+            var requestedPackages = BackupPackages.Count > 0
+                ? BackupPackages.Where(x => x.IsSelected)
+                    .Select(x => x.PackageName)
+                    .ToHashSet(StringComparer.Ordinal)
+                : null;
             var packages = await agent.GetPackagesAsync(
-                cancellationToken: cancellationToken);
+                packageNames: requestedPackages,
+                cancellationToken: cancellationToken,
+                hashArtifacts: BackupApps);
             if (BackupPackages.Count > 0)
             {
-                var selectedPackages = BackupPackages
-                    .Where(x => x.IsSelected)
-                    .Select(x => x.PackageName)
-                    .ToHashSet(StringComparer.Ordinal);
-                packages = packages.Where(x => selectedPackages.Contains(x.PackageName)).ToList();
                 if (packages.Count == 0 && (BackupApps || BackupAppData))
                     throw new InvalidOperationException("Не выбрано ни одного приложения.");
             }
@@ -941,7 +1008,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 RepositoryPath,
                 RepositoryPassword,
                 cancellationToken);
-            var backupDevice = SelectedDevice.Inventory;
+            var romIdentity = await agent.GetRomIdentityAsync(cancellationToken);
+            var backupDevice = SelectedDevice.Inventory with { Rom = romIdentity };
             var includeRootData = false;
             if (BackupAppData || FullMode)
             {
@@ -957,50 +1025,76 @@ public sealed class MainViewModel : INotifyPropertyChanged
                             : RootState.Unavailable
                 };
                 if (!includeRootData)
-                    MessageBox.Show(
+                    throw new InvalidOperationException(
                         (root.Granted
-                            ? "Root предоставлен, но root-helper не готов. " +
-                              "Snapshot продолжится только с APK."
-                            : "Root не предоставлен. Snapshot продолжится только с APK.") +
+                            ? "Root предоставлен, но root-helper не готов. "
+                            : "Root не предоставлен. ") +
+                        "Backup с выбранными приватными данными не начат, чтобы не создать " +
+                        "ложную APK-only копию." +
                         (string.IsNullOrWhiteSpace(root.Detail)
                             ? string.Empty
                             : $"\n\nДиагностика Agent: {root.Detail}") +
                         (root.Helper is { Ok: false } helper
                             ? $"\n\nRoot helper: exit={helper.ExitCode?.ToString() ?? "—"}; " +
                               $"stderr={helper.Stderr}"
-                            : string.Empty),
-                        "Ограниченный режим",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Information);
+                            : string.Empty));
+            }
+            PackageSnapshot? launcherPackage = null;
+            if (includeRootData && (BackupAppData || FullMode))
+            {
+                var homePackageName = await agent.GetHomePackageAsync(cancellationToken);
+                if (!string.IsNullOrWhiteSpace(homePackageName))
+                {
+                    launcherPackage = packages.FirstOrDefault(x =>
+                        string.Equals(x.PackageName, homePackageName, StringComparison.Ordinal));
+                    launcherPackage ??= (await agent.GetPackagesAsync(
+                            includeSystemApps: true,
+                            packageNames: [homePackageName],
+                            cancellationToken: cancellationToken))
+                        .SingleOrDefault();
+                }
             }
             var transferProgress = new Progress<TransferProgress>(value =>
-            {
-                StatusText = value.Stage == "complete"
-                    ? "Проверка и публикация снимка…"
-                    : $"APK: {value.Item} ({value.Completed + 1}/{value.Total})";
-            });
+                UpdateOperationProgress(value, restore: false));
             var coordinator = new BackupCoordinator(_adb);
-            var manifest = await coordinator.BackupPortableAsync(
-                serial,
-                backupDevice,
-                packages,
-                repository,
-                agent,
-                includeSystemApps: false,
-                includeApks: BackupApps,
-                includeAppData: includeRootData && BackupAppData,
-                includeSharedStorage: BackupSharedStorage,
-                includePersonalData: BackupPersonalData,
-                includeSystemState: true,
-                includeFullComponents: FullMode && includeRootData,
-                includeCaches: IncludeCaches,
-                fullHash: false,
-                progress: transferProgress,
-                cancellationToken: cancellationToken);
+            var manifest = await Task.Run(() => coordinator.BackupPortableAsync(
+                    serial,
+                    backupDevice,
+                    packages,
+                    repository,
+                    agent,
+                    includeSystemApps: false,
+                    includeApks: BackupApps,
+                    includeAppData: includeRootData && BackupAppData,
+                    includeSharedStorage: BackupSharedStorage,
+                    includePersonalData: BackupPersonalData,
+                    includeSystemState: true,
+                    includeFullComponents: FullMode && includeRootData,
+                    includeCaches: IncludeCaches,
+                    fullHash: false,
+                    launcherPackage: launcherPackage,
+                    progress: transferProgress,
+                    cancellationToken: cancellationToken),
+                cancellationToken);
+            var manifestAppCount = manifest.Components
+                .Where(x => x.Package is not null)
+                .Select(x => x.Package!.PackageName)
+                .Distinct(StringComparer.Ordinal)
+                .Count();
             SnapshotLines.Insert(
                 0,
-                $"{manifest.CreatedAtUtc.ToLocalTime():g} • {manifest.Components.Count} приложений • {manifest.SnapshotId[..8]}");
-            StatusText = $"Backup завершён: {manifest.Components.Count} приложений";
+                $"{manifest.CreatedAtUtc.ToLocalTime():g} • {manifestAppCount} приложений • " +
+                $"{manifest.Components.Count} компонентов • {manifest.SnapshotId[..8]}");
+            StatusText = manifest.Summary?.Status switch
+            {
+                ComponentStatus.Partial =>
+                    $"Backup частичный: " +
+                    $"{manifest.Summary.PartialComponents + manifest.Summary.FailedComponents + manifest.Summary.SkippedComponents} " +
+                    "компонентов неполные/пропущены",
+                ComponentStatus.Failed => "Backup завершился ошибкой",
+                _ => $"Backup завершён: {packages.Count} приложений, " +
+                     $"{manifest.Components.Count} компонентов"
+            };
             },
             cancellable: true,
             cancellationStatus:
@@ -1389,6 +1483,59 @@ public sealed class MainViewModel : INotifyPropertyChanged
         });
     }
 
+    private async Task CompareRestoreAsync(object? _)
+    {
+        if (SelectedDevice is null || SelectedSnapshot is null)
+        {
+            MessageBox.Show("Выберите устройство и snapshot.");
+            return;
+        }
+        await BusyAsync("Сравнение snapshot с телефоном…", async () =>
+        {
+            var packageComponents = SelectedSnapshot.Manifest.Components
+                .Where(x => x.Kind == "apk" && x.Package is not null)
+                .ToList();
+            var packageNames = packageComponents
+                .Select(x => x.Package!.PackageName)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            await using var agent = await AgentClient.ConnectAsync(
+                _adb,
+                SelectedDevice.PreferredSerial);
+            if (!await agent.PairWithApprovalAsync(
+                    TimeSpan.FromSeconds(60),
+                    new Progress<string>(x => StatusText = x)))
+                throw new UnauthorizedAccessException("Компьютер не подтверждён.");
+            var installed = (await agent.GetPackagesAsync(
+                    includeSystemApps: true,
+                    packageNames: packageNames,
+                    hashArtifacts: false))
+                .ToDictionary(x => x.PackageName, StringComparer.Ordinal);
+            var missing = packageNames
+                .Where(x => !installed.ContainsKey(x))
+                .ToList();
+            var signatureMismatch = packageComponents
+                .Where(x => installed.TryGetValue(x.Package!.PackageName, out var current) &&
+                            !RestoreCoordinator.SignatureMatches(x.Package, current))
+                .Select(x => x.Package!.PackageName)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var okCount = packageNames.Count - missing.Count - signatureMismatch.Count;
+            var lines = new List<string>
+            {
+                $"Совпали: {okCount}/{packageNames.Count}",
+                $"Отсутствуют: {missing.Count}",
+                $"Другая подпись: {signatureMismatch.Count}"
+            };
+            if (missing.Count > 0)
+                lines.Add("Отсутствуют: " + string.Join(", ", missing));
+            if (signatureMismatch.Count > 0)
+                lines.Add("Другая подпись: " + string.Join(", ", signatureMismatch));
+            RestoreReportText = string.Join(Environment.NewLine, lines);
+            StatusText = $"Сравнение завершено: совпали {okCount}/{packageNames.Count}";
+        });
+    }
+
     private async Task RestoreSnapshotAsync(object? _)
     {
         if (SelectedDevice is null || SelectedSnapshot is null)
@@ -1415,21 +1562,86 @@ public sealed class MainViewModel : INotifyPropertyChanged
                     cancellationToken))
                 throw new UnauthorizedAccessException("Компьютер не подтверждён.");
 
+            var currentRomIdentity = await agent.GetRomIdentityAsync(cancellationToken);
+            var targetInventory = SelectedDevice.Inventory with { Rom = currentRomIdentity };
+
             var snapshot = SelectedSnapshot.Manifest;
             var packageNames = snapshot.Components
                 .Where(x => x.Kind == "apk")
                 .Select(x => x.Id)
                 .ToList();
+            var launcherComponents = snapshot.Components
+                .Where(x => x.Kind == "launcher-data" && x.Package is not null)
+                .ToList();
+            var inventoryNames = packageNames
+                .Concat(launcherComponents.Select(x => x.Package!.PackageName))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
             var installed = await agent.GetPackagesAsync(
                 includeSystemApps: true,
-                packageNames,
-                cancellationToken);
+                inventoryNames,
+                cancellationToken,
+                hashArtifacts: false);
+            var activeHomePackage = launcherComponents.Count == 0
+                ? null
+                : await agent.GetHomePackageAsync(cancellationToken);
+            var installedByPackage = installed.ToDictionary(
+                x => x.PackageName,
+                StringComparer.Ordinal);
+            var compatibleLauncherPackages = launcherComponents
+                .Select(x => x.Package!)
+                .DistinctBy(x => x.PackageName, StringComparer.Ordinal)
+                .Where(x => string.Equals(
+                    x.PackageName,
+                    activeHomePackage,
+                    StringComparison.Ordinal))
+                .Where(x => installedByPackage.ContainsKey(x.PackageName))
+                .Where(x => RestoreCoordinator.SignatureMatches(
+                    x,
+                    installedByPackage[x.PackageName]))
+                .Where(_ => snapshot.FormatVersion < 2
+                    ? Math.Abs(snapshot.Device.Sdk - targetInventory.Sdk) <= 1
+                    : snapshot.Rom?.IsExactRomMatch(targetInventory.Rom) == true)
+                .Select(x => x.PackageName)
+                .ToList();
             var coordinator = new RestoreCoordinator(_adb);
             var report = coordinator.PlanApkRestore(
-                snapshot, SelectedDevice.Inventory, installed);
-            RestoreReportText = string.Join(
-                Environment.NewLine,
-                report.Items.Select(x => $"{x.Level}: {x.Component} — {x.Reason}"));
+                snapshot, targetInventory, installed);
+            RestoreReportText = FormatRestoreReport(report);
+            var settingsCoverage = await coordinator.ReadSettingsCoverageAsync(
+                snapshot,
+                repository,
+                cancellationToken);
+            if (settingsCoverage is not null)
+            {
+                RestoreReportText += Environment.NewLine +
+                    $"Настройки: поддержано {settingsCoverage.Supported}, " +
+                    $"только архив {settingsCoverage.Archived}, " +
+                    $"игнорируется {settingsCoverage.Ignored}, " +
+                    $"неизвестных ключей {settingsCoverage.Unknown}.";
+                if (settingsCoverage.UnknownSamples.Count > 0)
+                    RestoreReportText += Environment.NewLine +
+                        "Примеры неизвестных (не применяются): " +
+                        string.Join(", ", settingsCoverage.UnknownSamples);
+            }
+            var installedSnapshotPackages = installed
+                .Select(x => x.PackageName)
+                .ToHashSet(StringComparer.Ordinal);
+            var missingBeforeRestore = packageNames
+                .Where(x => !installedSnapshotPackages.Contains(x))
+                .ToList();
+            RestoreReportText += Environment.NewLine +
+                $"На телефоне до Restore: {packageNames.Count - missingBeforeRestore.Count}/{packageNames.Count} приложений.";
+            if (missingBeforeRestore.Count > 0)
+                RestoreReportText += Environment.NewLine +
+                    "Будут установлены: " + string.Join(", ", missingBeforeRestore);
+            if (launcherComponents.Count > 0)
+            {
+                RestoreReportText += Environment.NewLine +
+                    (compatibleLauncherPackages.Count > 0
+                        ? $"Conditional: раскладка рабочего стола будет восстановлена для {compatibleLauncherPackages[0]} (совпали package и Android SDK)."
+                        : "INFO: раскладка рабочего стола пропущена — активный Launcher или Android SDK не совпадают.");
+            }
             if (snapshot.Components.Any(x => x.Kind == "account-inventory"))
             {
                 RestoreReportText += Environment.NewLine +
@@ -1440,68 +1652,120 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var packageItems = report.Items
                 .Where(x => packageNames.Contains(x.Component, StringComparer.Ordinal))
                 .ToDictionary(x => x.Component, StringComparer.Ordinal);
-            var blocked = packageItems.Values
-                .Where(x => x.Level == CompatibilityLevel.Blocked)
-                .ToList();
-            if (blocked.Count > 0)
-                throw new InvalidOperationException(
-                    "Restore заблокирован:\n" + string.Join("\n", blocked.Select(x => $"{x.Component}: {x.Reason}")));
-
             var selected = packageNames
-                .Where(x => AllowDowngrade ||
-                            !packageItems.TryGetValue(x, out var item) ||
-                            item.Level != CompatibilityLevel.Conditional)
+                .Where(x => !packageItems.TryGetValue(x, out var item) ||
+                            (item.Level != CompatibilityLevel.Blocked &&
+                             (AllowDowngrade || item.Level != CompatibilityLevel.Conditional)))
                 .ToList();
-            if (selected.Count == 0)
-                throw new InvalidOperationException(
-                    "Все приложения требуют downgrade. Включите его вручную после проверки отчёта.");
+            var skippedByCompatibility = packageNames.Except(selected, StringComparer.Ordinal).ToList();
+            if (skippedByCompatibility.Count > 0)
+                RestoreReportText += Environment.NewLine +
+                    "Пропущены compatibility engine: " +
+                    string.Join(", ", skippedByCompatibility);
 
-            var restoreProgress = new Progress<TransferProgress>(value =>
-                StatusText = value.Item);
-            await coordinator.RestoreApksAsync(
-                serial,
-                snapshot,
-                SelectedDevice.Inventory,
-                installed,
-                repository,
-                agent,
-                selected,
-                AllowDowngrade,
-                createSafetySnapshot: true,
-                progress: restoreProgress,
-                cancellationToken: cancellationToken);
-            if (snapshot.Components.Any(x =>
-                    x.Kind == "app-data" &&
-                    x.Package is not null &&
-                    selected.Contains(x.Package.PackageName, StringComparer.Ordinal)))
-            {
-                var restoredPackages = await agent.GetPackagesAsync(
-                    includeSystemApps: true,
-                    packageNames: selected,
-                    cancellationToken: cancellationToken);
-                await coordinator.RestoreAppDataAsync(
+            var restoreProgress = new Progress<TransferProgress>(UpdateRestoreProgress);
+            var failedApkPackages = await Task.Run(
+                () => coordinator.RestoreApksAsync(
+                    serial,
                     snapshot,
-                    restoredPackages,
+                    targetInventory,
+                    installed,
                     repository,
                     agent,
                     selected,
-                    restoreProgress,
+                    AllowDowngrade,
+                    createSafetySnapshot: true,
+                    progress: restoreProgress,
+                    cancellationToken: cancellationToken),
+                cancellationToken);
+            if (failedApkPackages.Count > 0)
+            {
+                selected.RemoveAll(failedApkPackages.Contains);
+                RestoreReportText += Environment.NewLine +
+                    $"APK не появились после установки ({failedApkPackages.Count}): " +
+                    string.Join(", ", failedApkPackages);
+            }
+            RestoreReportText += Environment.NewLine +
+                $"APK подтверждены после установки: {selected.Count}/{packageNames.Count}.";
+            var selectedDataPackages = selected
+                .Concat(compatibleLauncherPackages)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (snapshot.Components.Any(x =>
+                    x.Kind is "app-data" or "launcher-data" &&
+                    x.Package is not null &&
+                    selectedDataPackages.Contains(
+                        x.Package.PackageName,
+                        StringComparer.Ordinal)))
+            {
+                var restoredPackages = await agent.GetPackagesAsync(
+                    includeSystemApps: true,
+                    packageNames: selectedDataPackages,
+                    cancellationToken: cancellationToken,
+                    hashArtifacts: false);
+                var appDataResults = await Task.Run(() => coordinator.RestoreAppDataAsync(
+                        snapshot,
+                        restoredPackages,
+                        repository,
+                        agent,
+                        selectedDataPackages,
+                        targetInventory.Rom,
+                        restoreProgress,
+                        cancellationToken),
                     cancellationToken);
+                RestoreReportText += Environment.NewLine +
+                    "Данные приложений:" + Environment.NewLine +
+                    string.Join(
+                        Environment.NewLine,
+                        appDataResults.OrderBy(x => x.Key, StringComparer.Ordinal)
+                            .Select(x => $"{x.Key}: {x.Value}"));
             }
             if (snapshot.Components.Any(x => x.Kind == "shared-storage"))
             {
-                await coordinator.RestoreSharedStorageAsync(
-                    snapshot,
-                    repository,
-                    agent,
-                    restoreProgress,
+                var sharedResults = await Task.Run(() => coordinator.RestoreSharedStorageAsync(
+                        snapshot,
+                        repository,
+                        agent,
+                        restoreProgress,
+                        cancellationToken),
                     cancellationToken);
+                RestoreReportText += Environment.NewLine +
+                    "Общая память:" + Environment.NewLine +
+                    string.Join(Environment.NewLine, sharedResults.Select(x =>
+                        $"{x.ComponentId}: {x.State}" +
+                        (string.IsNullOrWhiteSpace(x.Reason) ? "" : $"; {x.Reason}")));
             }
-            var policyFailures = await coordinator.RestorePackagePoliciesAsync(
-                snapshot,
-                agent,
-                selected,
-                restoreProgress,
+            var portablePersonal = snapshot.Components.Any(x =>
+                x.Kind == "personal-data" && x.RestoreClass == RestoreClass.Portable);
+            if (portablePersonal)
+            {
+                var mergePersonal = MessageBox.Show(
+                    "Объединить контакты и журнал звонков с данными телефона?\n\n" +
+                    "Существующие записи не удаляются; совпадения будут пропущены. " +
+                    "SMS/MMS остаются только в архиве.",
+                    "Личные данные",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                if (mergePersonal == MessageBoxResult.Yes)
+                {
+                    var personalResults = await Task.Run(() => coordinator.RestorePersonalDataAsync(
+                            snapshot, repository, agent, restoreProgress, cancellationToken),
+                        cancellationToken);
+                    RestoreReportText += Environment.NewLine + "Личные данные:" + Environment.NewLine +
+                        string.Join(Environment.NewLine, personalResults.Select(x =>
+                            $"{x.Kind}: {x.Status}; добавлено {x.Inserted}, " +
+                            $"дубликатов {x.Skipped}, ошибок {x.Failed}" +
+                            (string.IsNullOrWhiteSpace(x.Reason) ? "" : $"; {x.Reason}")));
+                }
+                else RestoreReportText += Environment.NewLine +
+                    "Контакты и журнал звонков пропущены пользователем.";
+            }
+            var policyFailures = await Task.Run(() => coordinator.RestorePackagePoliciesAsync(
+                    snapshot,
+                    agent,
+                    selected,
+                    restoreProgress,
+                    cancellationToken),
                 cancellationToken);
             if (policyFailures.Count > 0)
             {
@@ -1511,25 +1775,207 @@ public sealed class MainViewModel : INotifyPropertyChanged
                         Environment.NewLine,
                         policyFailures.Select(x => $"{x.Key}: {string.Join(", ", x.Value)}"));
             }
-            var systemFailures = await coordinator.RestoreSystemStateAsync(
-                snapshot,
-                repository,
-                agent,
-                restoreProgress,
+            var systemResult = await Task.Run(() => coordinator.RestoreSystemStateAsync(
+                    snapshot,
+                    repository,
+                    agent,
+                    confirmedSettingIds: null,
+                    progress: restoreProgress,
+                    cancellationToken: cancellationToken),
                 cancellationToken);
-            if (systemFailures.Count > 0)
+            if (systemResult.NeedsConfirmation.Count > 0)
+            {
+                var preview = string.Join(Environment.NewLine,
+                    systemResult.NeedsConfirmation.Take(20));
+                if (systemResult.NeedsConfirmation.Count > 20)
+                    preview += $"{Environment.NewLine}…ещё {systemResult.NeedsConfirmation.Count - 20}";
+                var confirmation = MessageBox.Show(
+                    "Эти системные настройки требуют явного подтверждения:\n\n" + preview +
+                    "\n\nПрименить их с проверкой read-back и rollback при ошибке?",
+                    "Подтверждение опасных настроек",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+                if (confirmation == MessageBoxResult.Yes)
+                    systemResult = await Task.Run(() => coordinator.RestoreSystemStateAsync(
+                            snapshot,
+                            repository,
+                            agent,
+                            systemResult.NeedsConfirmation,
+                            restoreProgress,
+                            cancellationToken),
+                        cancellationToken);
+                else
+                    RestoreReportText += Environment.NewLine +
+                        $"Настройки с подтверждением пропущены: {systemResult.NeedsConfirmation.Count}.";
+            }
+            if (systemResult.Failures.Count > 0)
             {
                 RestoreReportText += Environment.NewLine +
                     "Настройки, которые не удалось применить: " +
-                    string.Join(", ", systemFailures);
+                    string.Join(", ", systemResult.Failures);
             }
+            var rolledBackSettings = systemResult.Outcomes
+                .Where(x => x.Status == "rolled_back")
+                .Select(x => x.Id)
+                .ToList();
+            if (rolledBackSettings.Count > 0)
+                RestoreReportText += Environment.NewLine +
+                    "Настройки с выполненным rollback: " + string.Join(", ", rolledBackSettings);
+            var wallpaperResults = await Task.Run(() => coordinator.RestoreWallpapersAsync(
+                    snapshot,
+                    repository,
+                    agent,
+                    restoreProgress,
+                    cancellationToken),
+                cancellationToken);
+            if (wallpaperResults.Count > 0)
+                RestoreReportText += Environment.NewLine +
+                    "Обои: " + string.Join(", ", wallpaperResults.Select(x => $"{x.Key}={x.Value}"));
             StatusText = $"Restore завершён: {selected.Count} приложений";
+            OperationProgress = 100;
+            OperationProgressIndeterminate = false;
             PopulateSnapshots(await repository.ListSnapshotsAsync(cancellationToken));
             },
             cancellable: true,
             cancellationStatus:
             "Restore отменён. Телефон мог быть изменён частично; " +
             "повторите восстановление для завершения.");
+    }
+
+    internal static string FormatRestoreReport(CompatibilityReport report)
+    {
+        var safeCount = report.Items.Count(x => x.Level == CompatibilityLevel.Safe);
+        var conditionalCount = report.Items.Count(x => x.Level == CompatibilityLevel.Conditional);
+        var blockedCount = report.Items.Count(x => x.Level == CompatibilityLevel.Blocked);
+        var lines = new List<string>
+        {
+            $"Итог: без проблем — {safeCount}; требуют внимания — {conditionalCount}; заблокированы — {blockedCount}."
+        };
+        lines.AddRange(report.Items
+            .Where(x => x.Level != CompatibilityLevel.Safe)
+            .Select(x => $"{x.Level}: {x.Component} — {x.Reason}"));
+            if (safeCount > 0)
+            lines.Add($"Safe: {safeCount} компонентов прошли проверку; подробности скрыты.");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private void UpdateRestoreProgress(TransferProgress value) =>
+        UpdateOperationProgress(value, restore: true);
+
+    private void UpdateOperationProgress(TransferProgress value, bool restore)
+    {
+        var ratio = value.Total > 0
+            ? Math.Clamp((value.Completed + 1d) / value.Total, 0, 1)
+            : 0;
+        var (start, end, label) = value.Stage switch
+        {
+            "verify" => (2d, 10d, "Проверка backup"),
+            "safety-snapshot" => (10d, 18d, "Safety snapshot"),
+            "restore-approval" => (18d, 20d, "Подтверждение на телефоне"),
+            "restore-apk-stage" => (20d, 62d, "Подготовка APK"),
+            "restore-apk-stage-done" => (20d, 62d, "APK подготовлен"),
+            "restore-apk" => (20d, 62d, "Установка APK"),
+            "restore-apk-needs-user" => (20d, 62d, "Ожидается подтверждение Play Protect"),
+            "restore-apk-done" => (20d, 62d, "APK установлен"),
+            "restore-apk-failed" => (20d, 62d, "Ошибка APK"),
+            "restore-app-data" => (62d, 86d, "Данные приложений"),
+            "restore-app-data-done" => (62d, 86d, "Данные восстановлены"),
+            "restore-app-data-skipped" => (62d, 86d, "Данные пропущены"),
+            "restore-app-data-rolled-back" => (62d, 86d, "Данные откатились"),
+            "restore-app-data-failed" => (62d, 86d, "Ошибка отката данных"),
+            "restore-shared" => (86d, 92d, "Общая память"),
+            "restore-shared-done" => (86d, 92d, "Общая память восстановлена"),
+            "restore-shared-failed" => (86d, 92d, "Ошибка общей памяти"),
+            "restore-policy" => (92d, 96d, "Разрешения и политики"),
+            "restore-personal" => (92d, 96d, "Контакты и звонки"),
+            "restore-personal-done" => (92d, 96d, "Личные данные объединены"),
+            "restore-personal-failed" => (92d, 96d, "Ошибка личных данных"),
+            "restore-system-state" => (96d, 100d, "Системные настройки"),
+            "restore-wallpaper" => (96d, 100d, "Обои"),
+            "restore-wallpaper-done" => (96d, 100d, "Обои применены"),
+            "restore-wallpaper-failed" => (96d, 100d, "Ошибка обоев"),
+            "apk" => (0d, 25d, "APK"),
+            "app-data" => (25d, 62d, "Приватные данные"),
+            "launcher-data" => (62d, 70d, "Launcher"),
+            "shared-storage" => (70d, 82d, "Общие файлы"),
+            "personal-data" => (82d, 88d, "Личные данные"),
+            "system-state" => (88d, 94d, "Настройки системы/ROM"),
+            "wallpaper" => (94d, 96d, "Обои home/lock"),
+            "full" => (94d, 98d, "Архивные компоненты"),
+            "complete" => (98d, 100d, "Проверка и публикация"),
+            _ => (0d, 10d, value.Stage)
+        };
+        OperationProgressIndeterminate = false;
+        var nextProgress = start + (end - start) * ratio;
+        OperationProgress = restore ? Math.Max(OperationProgress, nextProgress) : nextProgress;
+        StatusText = value.Total > 0
+            ? $"{label}: {value.Item} ({Math.Min(value.Completed + 1, value.Total)}/{value.Total})"
+            : $"{label}: {value.Item}";
+
+        var state = ProgressState(value.Stage);
+        var baseStage = NormalizeProgressStage(value.Stage);
+        var itemName = ProgressItemName(value.Item, state);
+        var key = $"{baseStage}|{itemName}";
+        if (!_operationItemsByKey.TryGetValue(key, out var row))
+        {
+            foreach (var previous in OperationItems.Where(x =>
+                         x.State == RestoreItemState.Running &&
+                         x.Key.StartsWith(baseStage + "|", StringComparison.Ordinal)))
+                previous.State = RestoreItemState.Succeeded;
+
+            row = new OperationProgressItemViewModel
+            {
+                Key = key,
+                Stage = label,
+                Item = itemName,
+                State = state
+            };
+            _operationItemsByKey[key] = row;
+            OperationItems.Add(row);
+        }
+        else
+        {
+            row.Stage = label;
+            row.State = state;
+        }
+        row.Progress = value.Total > 0
+            ? $"{Math.Min(value.Completed + 1, value.Total)}/{value.Total}"
+            : string.Empty;
+        row.Message = string.Equals(itemName, value.Item, StringComparison.Ordinal)
+            ? string.Empty
+            : value.Item[(itemName.Length + 1)..].Trim();
+
+        if (value.Stage == "complete")
+            foreach (var pending in OperationItems.Where(x => x.State == RestoreItemState.Running))
+                pending.State = RestoreItemState.Succeeded;
+    }
+
+    private static RestoreItemState ProgressState(string stage) => stage switch
+    {
+        var x when x.EndsWith("-done", StringComparison.Ordinal) => RestoreItemState.Succeeded,
+        var x when x.EndsWith("-skipped", StringComparison.Ordinal) => RestoreItemState.Skipped,
+        var x when x.EndsWith("-failed", StringComparison.Ordinal) => RestoreItemState.Failed,
+        var x when x.EndsWith("-rolled-back", StringComparison.Ordinal) => RestoreItemState.RolledBack,
+        var x when x.EndsWith("-needs-user", StringComparison.Ordinal) => RestoreItemState.NeedsUser,
+        "restore-approval" => RestoreItemState.NeedsUser,
+        _ => RestoreItemState.Running
+    };
+
+    private static string NormalizeProgressStage(string stage)
+    {
+        foreach (var suffix in new[]
+                 { "-rolled-back", "-needs-user", "-skipped", "-failed", "-done" })
+            if (stage.EndsWith(suffix, StringComparison.Ordinal))
+                return stage[..^suffix.Length];
+        return stage;
+    }
+
+    private static string ProgressItemName(string item, RestoreItemState state)
+    {
+        if (state is RestoreItemState.Failed or RestoreItemState.RolledBack &&
+            item.IndexOf(':') is var separator && separator > 0)
+            return item[..separator];
+        return item;
     }
 
     private async Task VerifyRepositoryAsync(object? _)
@@ -1847,6 +2293,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
             ? _operationCancellation.Begin()
             : CancellationToken.None;
         IsBusy = true;
+        OperationItems.Clear();
+        _operationItemsByKey.Clear();
+        OperationProgress = 0;
+        OperationProgressIndeterminate = true;
         RaiseCancellationState();
         StatusText = status;
         DesktopDiagnostics.Log(
@@ -1858,6 +2308,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         try
         {
             await action(cancellationToken);
+            OperationProgress = 100;
+            OperationProgressIndeterminate = false;
             DesktopDiagnostics.Log(
                 "info",
                 "operation",
@@ -1869,6 +2321,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            OperationProgressIndeterminate = false;
             StatusText = cancellationStatus;
             DesktopDiagnostics.Log(
                 "info",
@@ -1881,6 +2334,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception exception)
         {
+            OperationProgressIndeterminate = false;
             StatusText = exception.Message;
             DesktopDiagnostics.Log(
                 "error",

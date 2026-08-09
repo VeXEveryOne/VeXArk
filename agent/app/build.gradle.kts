@@ -28,8 +28,8 @@ android {
         applicationId = "com.vex.phonebackup.agent"
         minSdk = 29
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.8.0-beta.4"
+        versionCode = 14
+        versionName = "0.9.0-beta.1"
         manifestPlaceholders["appLabel"] = "VeXArk Agent"
         buildConfigField("String", "BUILD_CHANNEL", "\"stable\"")
         buildConfigField("String", "BUILD_ID", "\"$vexarkBuildId\"")
@@ -60,10 +60,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = if (System.getenv("VEXARK_KEYSTORE_PATH").isNullOrBlank())
-                signingConfigs.getByName("debug")
-            else
-                signingConfigs.getByName("production")
+            // A stable build must never silently fall back to the debug certificate.
+            signingConfig = signingConfigs.getByName("production")
         }
     }
 

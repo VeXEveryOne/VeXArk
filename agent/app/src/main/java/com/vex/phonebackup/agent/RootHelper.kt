@@ -143,6 +143,24 @@ object RootHelper {
         success
     }
 
+    fun readWallpaper(
+        context: Context,
+        kind: String,
+        emit: (ByteArray) -> Unit
+    ): Boolean = withExtracted(context) { helper ->
+        if (kind !in setOf("system", "lock")) return@withExtracted false
+        val command = "${quote(helper.absolutePath)} read-wallpaper --kind ${quote(kind)}"
+        val outcome = streamFromRootPipe(context, "wallpaper", command) { input ->
+            val buffer = ByteArray(256 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) emit(buffer.copyOf(count))
+            }
+        }
+        outcome.result?.isSuccess == true && outcome.failure == null
+    }
+
     fun restore(
         context: Context,
         root: String,
@@ -151,6 +169,8 @@ object RootHelper {
         uid: Int,
         gid: Int,
         modifiedUnixNanos: Long,
+        expectedSize: Long,
+        expectedBlake3: String?,
         selinuxLabel: String?,
         consume: (OutputStream) -> Unit
     ): Boolean = withExtracted(context) { helper ->
@@ -166,6 +186,10 @@ object RootHelper {
                 append(" --uid ").append(uid)
                 append(" --gid ").append(gid)
                 append(" --modified-unix-nanos ").append(modifiedUnixNanos)
+                append(" --expected-size ").append(expectedSize)
+                if (!expectedBlake3.isNullOrBlank()) {
+                    append(" --expected-blake3 ").append(quote(expectedBlake3))
+                }
                 if (!selinuxLabel.isNullOrBlank()) {
                     append(" --selinux-label ").append(quote(selinuxLabel))
                 }
@@ -204,8 +228,11 @@ object RootHelper {
         Shell.cmd(command).exec().isSuccess
     }
 
+    fun <T> withExtracted(context: Context, block: (File) -> T): T =
+        block(ensureExtracted(context))
+
     @Synchronized
-    fun <T> withExtracted(context: Context, block: (File) -> T): T {
+    private fun ensureExtracted(context: Context): File {
         val directory = File(context.noBackupFilesDir, "root-helper").apply { mkdirs() }
         val target = File(directory, "phonebackup-helper-${BuildConfig.VERSION_CODE}")
         if (!target.isFile) {
@@ -221,13 +248,14 @@ object RootHelper {
                 temporary.delete()
             }
         }
-        return block(target)
+        return target
     }
 
-    @Synchronized
-    fun cleanup(context: Context) {
-        File(context.noBackupFilesDir, "root-helper").listFiles()?.forEach(File::delete)
-        File(context.noBackupFilesDir, "root-pipes").listFiles()?.forEach(File::delete)
+    fun cleanupStalePipes(context: Context) {
+        val cutoff = System.currentTimeMillis() - 30 * 60 * 1000L
+        File(context.noBackupFilesDir, "root-pipes").listFiles()
+            ?.filter { it.lastModified() < cutoff }
+            ?.forEach(File::delete)
     }
 
     private fun streamFromRootPipe(

@@ -2,4 +2,5 @@
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/vexark_black" />
     <foreground android:drawable="@drawable/ic_vexark_foreground" />
+    <monochrome android:drawable="@drawable/ic_vexark_foreground" />
 </adaptive-icon>

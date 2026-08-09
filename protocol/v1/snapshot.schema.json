@@ -23,7 +23,8 @@
           "kind": {
             "enum": [
               "apk", "app-data", "shared-storage", "personal-data",
-              "personal-data-report", "account-inventory", "system-state", "full"
+              "personal-data-report", "account-inventory", "system-state", "full",
+              "launcher-data", "backup-report"
             ]
           },
           "files": { "type": "array", "items": { "$ref": "#/$defs/fileEntry" } },

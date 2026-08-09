@@ -56,9 +56,13 @@ public static class CompatibilityEngine
     public static CompatibilityReport Compare(DeviceInventory source, DeviceInventory target)
     {
         var items = new List<CompatibilityItem>();
-        var exact = source.Device == target.Device &&
+        var exact = source.Rom is not null && source.Rom.IsExactRomMatch(target.Rom);
+        if (source.Rom is null || target.Rom is null)
+        {
+            exact = source.Device == target.Device &&
                     source.Sdk == target.Sdk &&
                     source.Fingerprint == target.Fingerprint;
+        }
         var sameFamily = source.Device == target.Device && source.Sdk == target.Sdk;
 
         items.Add(new(
@@ -73,11 +77,6 @@ public static class CompatibilityEngine
             sameFamily ? "Same device and SDK; explicit confirmation required." :
             "Wi-Fi internals are ROM-specific."));
         items.Add(new(
-            "full.systemui",
-            exact ? CompatibilityLevel.Conditional : CompatibilityLevel.Blocked,
-            exact ? "Raw SystemUI state always requires explicit confirmation." :
-            "SystemUI state is blocked across builds."));
-        items.Add(new(
             "full.root_modules",
             exact ? CompatibilityLevel.Conditional : CompatibilityLevel.Blocked,
             "Root modules are never restored automatically."));
@@ -87,5 +86,20 @@ public static class CompatibilityEngine
             : items.MaxBy(x => x.Level)!.Level;
         return new(overall, items);
     }
-}
 
+    public static bool Allows(
+        RestoreClass restoreClass,
+        DeviceInventory source,
+        DeviceInventory target,
+        bool explicitlyConfirmed = false) => restoreClass switch
+        {
+            RestoreClass.Portable => source.Sdk <= target.Sdk + 1,
+            RestoreClass.ExactRom => explicitlyConfirmed &&
+                                     source.Rom?.IsExactRomMatch(target.Rom) == true,
+            RestoreClass.ExactDevice => explicitlyConfirmed &&
+                                        source.Rom?.IsExactRomMatch(target.Rom) == true &&
+                                        string.Equals(source.Device, target.Device,
+                                            StringComparison.Ordinal),
+            _ => false
+        };
+}

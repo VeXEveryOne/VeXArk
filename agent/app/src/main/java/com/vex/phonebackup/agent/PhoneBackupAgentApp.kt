@@ -4,7 +4,6 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.os.Build
 import com.topjohnwu.superuser.Shell
 
 class PhoneBackupAgentApp : Application() {
@@ -24,7 +23,6 @@ class PhoneBackupAgentApp : Application() {
 
     companion object {
         fun updateNotificationChannel(context: Context, russian: Boolean) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(
                     AgentForegroundService.CHANNEL_ID,

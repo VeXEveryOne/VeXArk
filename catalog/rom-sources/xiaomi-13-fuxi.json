@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "device": {
+    "manufacturer": "Xiaomi",
+    "model": "Xiaomi 13",
+    "codename": "fuxi",
+    "forumSource": "https://4pda.to/forum/index.php?showtopic=1076571",
+    "forumIndexCheckedAt": "2026-08-01",
+    "forumAccess": "search-index; direct request returned HTTP 403"
+  },
+  "policy": {
+    "discoveryOnly": true,
+    "runtimePromotionRequires": [
+      "manual semantic review",
+      "typed value validator",
+      "target capability probe",
+      "read-back verification",
+      "rollback implementation"
+    ]
+  },
+  "roms": [
+    {
+      "id": "project-matrixx",
+      "displayName": "Project Matrixx",
+      "forumBuilds": ["Android 14 v10.10.0 UNOFFICIAL"],
+      "sourceStatus": "historical-manifest-verified-current-components-used-for-discovery",
+      "manifest": {"url": "https://github.com/ProjectMatrixx/android.git", "revision": "14.0"},
+      "repositories": [
+        {"role": "current-custom-settings-reference", "url": "https://github.com/ProjectMatrixx/packages_apps_MatrixxLab.git", "revision": "16.2"},
+        {"role": "current-settings-reference", "url": "https://github.com/ProjectMatrixx/packages_apps_Settings.git", "revision": "16.2"}
+      ]
+    },
+    {
+      "id": "aospa-extended-build",
+      "displayName": "AEX (AOSPA Extended build from forum)",
+      "forumBuilds": ["Android 14 AEX (AOSPA Extended)"],
+      "sourceStatus": "exact-build-source-unverified",
+      "manifest": {"url": "https://github.com/AOSPA/manifest.git", "revision": "uvite"},
+      "repositories": []
+    },
+    {
+      "id": "alphadroid",
+      "displayName": "AlphaDroid",
+      "forumBuilds": ["Android 14 v2.6.1 EOL UNOFFICIAL", "Android 13 v1.10"],
+      "sourceStatus": "historical-manifest-verified-newer-components-used-for-discovery",
+      "manifest": {"url": "https://github.com/AlphaDroid-Project/manifest.git", "revision": "alpha-14"},
+      "repositories": []
+    },
+    {
+      "id": "risingos",
+      "displayName": "RisingOS",
+      "forumBuilds": ["Android 14"],
+      "sourceStatus": "verified-upstream-not-exact-build",
+      "manifest": {"url": "https://github.com/RisingTechOSS/android.git", "revision": "fourteen"},
+      "repositories": []
+    },
+    {
+      "id": "lineageos",
+      "displayName": "LineageOS",
+      "forumBuilds": ["Android 14 LineageOS 21 Stable", "Android 13 LineageOS 20 BETA"],
+      "sourceStatus": "verified-upstream-not-exact-build",
+      "manifest": {"url": "https://github.com/LineageOS/android.git", "revision": "lineage-21.0"},
+      "repositories": [
+        {"role": "lineage-parts", "url": "https://github.com/LineageOS/android_packages_apps_LineageParts.git", "revision": "lineage-21.0"},
+        {"role": "lineage-sdk", "url": "https://github.com/LineageOS/android_lineage-sdk.git", "revision": "lineage-21.0"}
+      ]
+    },
+    {
+      "id": "cherishos",
+      "displayName": "CherishOS",
+      "forumBuilds": ["Android 14 v5.5 OFFICIAL", "Android 14 v5.4 OFFICIAL"],
+      "sourceStatus": "verified-upstream-not-exact-build",
+      "manifest": {"url": "https://github.com/CherishOS/android_manifest.git", "revision": "udc"},
+      "repositories": []
+    },
+    {
+      "id": "everestos",
+      "displayName": "Project EverestOS",
+      "forumBuilds": ["Android 14 Official"],
+      "sourceStatus": "manifest-not-yet-verified",
+      "repositories": []
+    },
+    {
+      "id": "aospa",
+      "displayName": "Paranoid Android",
+      "forumBuilds": ["Android 14 Uvite Beta", "Android 13 Topaz Alpha 1"],
+      "sourceStatus": "verified-upstream-not-exact-build",
+      "manifest": {"url": "https://github.com/AOSPA/manifest.git", "revision": "uvite"},
+      "repositories": []
+    },
+    {
+      "id": "crdroid",
+      "displayName": "crDroid",
+      "forumBuilds": ["Android 13 crDroid 8.16 (forum classification)"],
+      "sourceStatus": "version-to-branch-needs-review",
+      "manifest": {"url": "https://github.com/crdroidandroid/android.git", "revision": "13.0"},
+      "repositories": [
+        {"role": "settings", "url": "https://github.com/crdroidandroid/android_packages_apps_Settings.git", "revision": "13.0"},
+        {"role": "lineage-parts", "url": "https://github.com/crdroidandroid/android_packages_apps_LineageParts.git", "revision": "13.0"}
+      ]
+    },
+    {
+      "id": "ancientos",
+      "displayName": "AncientOS",
+      "forumBuilds": ["Android 13 v7.3 TexasCake BETA"],
+      "sourceStatus": "manifest-not-yet-verified",
+      "repositories": []
+    },
+    {
+      "id": "evolution-x",
+      "displayName": "Evolution X",
+      "forumBuilds": ["Android 13 v7.9.9"],
+      "sourceStatus": "verified-upstream-not-exact-build",
+      "manifest": {"url": "https://github.com/Evolution-X/manifest.git", "revision": "tiramisu"},
+      "repositories": [
+        {"role": "android14-custom-settings-reference", "url": "https://github.com/Evolution-X/packages_apps_Evolver.git", "revision": "udc"},
+        {"role": "android14-settings-reference", "url": "https://github.com/Evolution-X/packages_apps_Settings.git", "revision": "udc"}
+      ]
+    },
+    {
+      "id": "aospextended",
+      "displayName": "AospExtended",
+      "forumBuilds": [],
+      "sourceStatus": "historical-upstream-reference-only",
+      "manifest": {"url": "https://github.com/AospExtended/manifest.git", "revision": "9.x"},
+      "repositories": []
+    },
+    {
+      "id": "flyme-port",
+      "displayName": "Flyme 11 port",
+      "forumBuilds": ["Android 14 section"],
+      "sourceStatus": "proprietary-port-no-complete-source",
+      "repositories": []
+    }
+  ]
+}

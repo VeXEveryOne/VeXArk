@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-01",
+  "device": "xiaomi-fuxi",
+  "discoveryOnly": true,
+  "warning": "Counts include preference screens and navigation keys. No finding is a restore allow-list entry.",
+  "runs": [
+    {
+      "romId": "lineageos",
+      "android": 14,
+      "findingCount": 397,
+      "byRestoreClass": {
+        "portableCandidate": 127,
+        "exactDevice": 75,
+        "archiveOnly": 195
+      },
+      "sources": [
+        {
+          "role": "lineage-parts",
+          "revision": "lineage-21.0",
+          "commit": "ec73f047ec5fecda899808fe1dd94d5ac4586c1f",
+          "filesScanned": 371
+        },
+        {
+          "role": "lineage-sdk",
+          "revision": "lineage-21.0",
+          "commit": "d473c51e33a0b59b68bd32edc596d296f32e6d91",
+          "filesScanned": 346
+        }
+      ],
+      "topCategories": {
+        "other": 126,
+        "hardware": 55,
+        "input_gestures": 52,
+        "notifications": 34,
+        "display": 28,
+        "status_bar": 24,
+        "battery_charging": 21,
+        "privacy_security": 21
+      }
+    },
+    {
+      "romId": "crdroid",
+      "android": 13,
+      "findingCount": 3433,
+      "byRestoreClass": {
+        "exactRom": 141,
+        "exactDevice": 101,
+        "archiveOnly": 3165,
+        "never": 26
+      },
+      "sources": [
+        {
+          "role": "settings",
+          "revision": "13.0",
+          "commit": "30c33b006d30e73859c363a922a09d46f28b752c",
+          "filesScanned": 6082
+        },
+        {
+          "role": "lineage-parts",
+          "revision": "13.0",
+          "commit": "6f2d3de8aea54939c525d921ce0d7da8556c6e66",
+          "filesScanned": 369
+        }
+      ],
+      "topCategories": {
+        "other": 1415,
+        "network": 455,
+        "input_gestures": 287,
+        "privacy_security": 228,
+        "notifications": 226,
+        "accessibility": 208,
+        "sound_haptics": 164,
+        "display": 140
+      }
+    }
+  ]
+}

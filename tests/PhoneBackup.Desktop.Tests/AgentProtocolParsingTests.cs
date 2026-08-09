@@ -10,7 +10,7 @@ public sealed class AgentProtocolParsingTests
     public void ResponseEnvelopeAcceptsMatchingProtocolAndRequest()
     {
         using var document = JsonDocument.Parse(
-            """{"protocolVersion":1,"requestId":"request-1","ok":true}""");
+            """{"protocolVersion":2,"requestId":"request-1","ok":true}""");
 
         AgentClient.ValidateResponseEnvelope(
             document.RootElement,
@@ -23,7 +23,7 @@ public sealed class AgentProtocolParsingTests
     public void ResponseEnvelopeRejectsMismatchedRequest()
     {
         using var document = JsonDocument.Parse(
-            """{"protocolVersion":1,"requestId":"wrong","ok":true}""");
+            """{"protocolVersion":2,"requestId":"wrong","ok":true}""");
 
         var error = Assert.Throws<InvalidDataException>(() =>
             AgentClient.ValidateResponseEnvelope(

@@ -1,10 +1,31 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using PhoneBackup.Core;
 
 namespace PhoneBackup.Core.Tests;
 
 public sealed class RepositoryTests
 {
+    [Fact]
+    public async Task NewRepositoryHeaderUsesSchemaCompatibleCamelCase()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"phonebackup-test-{Guid.NewGuid():N}");
+        try
+        {
+            await EncryptedRepository.CreateAsync(root, "correct horse battery staple");
+            using var document = JsonDocument.Parse(
+                await File.ReadAllBytesAsync(Path.Combine(root, "repository.json")));
+
+            Assert.True(document.RootElement.TryGetProperty("formatVersion", out _));
+            Assert.True(document.RootElement.TryGetProperty("repositoryId", out _));
+            Assert.False(document.RootElement.TryGetProperty("FormatVersion", out _));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task RepositoryRoundTripAndDeduplicates()
     {
@@ -34,6 +55,31 @@ public sealed class RepositoryTests
             await using var restoredByRecovery = new MemoryStream();
             await recovered.RestoreStreamAsync(first, restoredByRecovery);
             Assert.Equal(payload, restoredByRecovery.ToArray());
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task VerifyFileChecksChunksSizeAndWholeFileHashInOnePass()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"phonebackup-test-{Guid.NewGuid():N}");
+        try
+        {
+            await EncryptedRepository.CreateAsync(root, "correct horse battery staple");
+            var repository = await EncryptedRepository.OpenWithPasswordAsync(
+                root, "correct horse battery staple");
+            var payload = RandomNumberGenerator.GetBytes(FastCdcChunker.AverageSize + 317);
+            var chunks = await repository.PutStreamAsync(new MemoryStream(payload));
+            var sha256 = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+
+            await repository.VerifyFileAsync(chunks, payload.LongLength, sha256);
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                repository.VerifyFileAsync(chunks, payload.LongLength, new string('0', 64)));
+            await Assert.ThrowsAsync<InvalidDataException>(() =>
+                repository.VerifyFileAsync(chunks, payload.LongLength + 1, sha256));
         }
         finally
         {
@@ -79,8 +125,106 @@ public sealed class RepositoryTests
             var bytes = await File.ReadAllBytesAsync(path);
             bytes[^1] ^= 0x40;
             await File.WriteAllBytesAsync(path, bytes);
-            await Assert.ThrowsAnyAsync<CryptographicException>(
-                () => repository.ListSnapshotsAsync());
+            Assert.Empty(await repository.ListSnapshotsAsync());
+            Assert.Single(repository.SnapshotErrors);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ManifestV2RejectsFalseCompleteComponent()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"phonebackup-test-{Guid.NewGuid():N}");
+        try
+        {
+            await EncryptedRepository.CreateAsync(root, "correct horse battery staple");
+            var repository = await EncryptedRepository.OpenWithPasswordAsync(
+                root, "correct horse battery staple");
+            var component = new BackupComponentManifest(
+                "broken",
+                "app-data",
+                [new("prefs.xml", "file", 12, 0, 0, 0, 0, null, null, null)],
+                12,
+                0,
+                Status: ComponentStatus.Complete,
+                RestoreClass: RestoreClass.Portable,
+                SchemaId: "vexark.app-data",
+                SchemaVersion: 2);
+            var manifest = new SnapshotManifest(
+                2,
+                Guid.NewGuid().ToString("N"),
+                DateTimeOffset.UtcNow,
+                BackupMode.Portable,
+                new("device", "Model", "device", "16", 36, "fingerprint", "arm64-v8a",
+                    "Enforcing", RootState.Granted, []),
+                [component],
+                new(0, 0, []),
+                Summary: new(ComponentStatus.Complete, 1, 0, 0, 0, []));
+
+            await Assert.ThrowsAsync<InvalidDataException>(
+                () => repository.CommitSnapshotAsync(manifest));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ValidManifestV2RoundTripsWithVerifiedEmptyComponent()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"phonebackup-test-{Guid.NewGuid():N}");
+        try
+        {
+            await EncryptedRepository.CreateAsync(root, "correct horse battery staple");
+            var repository = await EncryptedRepository.OpenWithPasswordAsync(
+                root, "correct horse battery staple");
+            var component = new BackupComponentManifest(
+                "archive.empty", "full", [], 0, 0,
+                Status: ComponentStatus.Complete,
+                RestoreClass: RestoreClass.ArchiveOnly,
+                SchemaId: "vexark.test.empty",
+                SchemaVersion: 2,
+                Verification: new(0, 0, 0, 0, true));
+            var manifest = new SnapshotManifest(
+                2, Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow,
+                BackupMode.Full,
+                new("device", "Model", "device", "16", 36, "spoofed", "arm64-v8a",
+                    "Enforcing", RootState.Granted, []),
+                [component], new(0, 0, []),
+                Summary: new(ComponentStatus.Complete, 1, 0, 0, 0, []));
+
+            await repository.CommitSnapshotAsync(manifest);
+
+            var loaded = Assert.Single(await repository.ListSnapshotsAsync());
+            Assert.Equal(2, loaded.FormatVersion);
+            Assert.Equal(ComponentStatus.Complete, loaded.Summary!.Status);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task RepositoryLeaseBlocksAnotherProcessHandle()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"phonebackup-test-{Guid.NewGuid():N}");
+        try
+        {
+            await EncryptedRepository.CreateAsync(root, "correct horse battery staple");
+            var first = await EncryptedRepository.OpenWithPasswordAsync(
+                root, "correct horse battery staple");
+            var second = await EncryptedRepository.OpenWithPasswordAsync(
+                root, "correct horse battery staple");
+            await using var held = await first.AcquireOperationLeaseAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await second.AcquireOperationLeaseAsync(timeout.Token));
         }
         finally
         {
